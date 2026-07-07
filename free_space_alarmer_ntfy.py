@@ -23,8 +23,10 @@ from typing import Any
 
 DEFAULT_CONFIG_PATH = "/etc/free-space-alarmer-ntfy/config.json"
 DEFAULT_THRESHOLD_FREE_PERCENT = 10.0
+DEFAULT_THRESHOLD_FREE_PERCENT_TEXT = "10"
 DEFAULT_NOTIFY_NOT_BEFORE = "10:00"
 DEFAULT_NOTIFY_NOT_AFTER = "20:00"
+DEFAULT_TIMER_INTERVAL_HOURS = 1
 GIB = 1024**3
 TIME_VALUE_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
@@ -529,6 +531,344 @@ def run(config: dict[str, Any], *, test_mode: bool, dry_run: bool) -> int:
     return 0
 
 
+# Installer helpers keep install.sh as shell orchestration instead of embedding Python snippets.
+def installer_url_default(value: Any, *, strip_trailing_slash: bool = False) -> str:
+    text = string_config_value(value)
+    if strip_trailing_slash:
+        text = text.rstrip("/")
+    if re.fullmatch(r"https?://.+", text):
+        return text
+    return ""
+
+
+def installer_threshold_default(value: Any) -> str:
+    text = string_config_value(value)
+    try:
+        parse_threshold_free_percent(text)
+    except SystemExit:
+        return DEFAULT_THRESHOLD_FREE_PERCENT_TEXT
+    return text
+
+
+def installer_time_default(value: Any, fallback: str) -> str:
+    try:
+        return normalize_time_value(value, "installer default")
+    except SystemExit:
+        return fallback
+
+
+def installer_timer_interval_default(value: Any) -> str:
+    text = string_config_value(value)
+    if re.fullmatch(r"[1-9][0-9]*", text):
+        return text
+    return str(DEFAULT_TIMER_INTERVAL_HOURS)
+
+
+def installer_blacklist_mount_points(config: dict[str, Any]) -> list[str]:
+    blacklist = config.get("blacklist", {})
+    if not isinstance(blacklist, dict):
+        return []
+
+    values = blacklist.get("mount_points", [])
+    if not isinstance(values, list):
+        return []
+
+    mount_points: list[str] = []
+    for value in values:
+        mount_point = string_config_value(value)
+        if mount_point and mount_point not in mount_points:
+            mount_points.append(mount_point)
+    return mount_points
+
+
+def installer_default_values() -> dict[str, Any]:
+    return {
+        "ntfy_base_url": "",
+        "ntfy_topic": "",
+        "ntfy_bearer_token": "",
+        "mattermost_webhook_url": "",
+        "machine_name": "",
+        "threshold_free_percent": DEFAULT_THRESHOLD_FREE_PERCENT_TEXT,
+        "notify_not_before": DEFAULT_NOTIFY_NOT_BEFORE,
+        "notify_not_after": DEFAULT_NOTIFY_NOT_AFTER,
+        "timer_interval_hours": str(DEFAULT_TIMER_INTERVAL_HOURS),
+        "blacklist_mount_points": [],
+    }
+
+
+def load_installer_defaults(config_path: str, label: str) -> tuple[dict[str, Any], bool]:
+    defaults = installer_default_values()
+    if not config_path:
+        return defaults, False
+
+    path = Path(config_path)
+    if not path.is_file():
+        return defaults, False
+
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(config, dict):
+            raise ValueError("top-level JSON value is not an object")
+    except (OSError, ValueError, json.JSONDecodeError):
+        print(f"Could not load defaults from {label}; using installer defaults.", file=sys.stderr)
+        return defaults, False
+
+    defaults.update(
+        {
+            "ntfy_base_url": installer_url_default(config.get("ntfy_base_url"), strip_trailing_slash=True),
+            "ntfy_topic": normalize_ntfy_topic(config.get("ntfy_topic")),
+            "ntfy_bearer_token": string_config_value(config.get("ntfy_bearer_token")),
+            "mattermost_webhook_url": installer_url_default(config.get("mattermost_webhook_url")),
+            "machine_name": string_config_value(config.get("machine_name")),
+            "threshold_free_percent": installer_threshold_default(
+                config.get("threshold_free_percent", DEFAULT_THRESHOLD_FREE_PERCENT_TEXT)
+            ),
+            "notify_not_before": installer_time_default(
+                config.get("notify_not_before", DEFAULT_NOTIFY_NOT_BEFORE),
+                DEFAULT_NOTIFY_NOT_BEFORE,
+            ),
+            "notify_not_after": installer_time_default(
+                config.get("notify_not_after", DEFAULT_NOTIFY_NOT_AFTER),
+                DEFAULT_NOTIFY_NOT_AFTER,
+            ),
+            "timer_interval_hours": installer_timer_interval_default(
+                config.get("timer_interval_hours", DEFAULT_TIMER_INTERVAL_HOURS)
+            ),
+            "blacklist_mount_points": installer_blacklist_mount_points(config),
+        }
+    )
+    print(f"Loaded defaults from {label}.")
+    return defaults, True
+
+
+def prompt_required(prompt: str, default: str = "") -> str:
+    while True:
+        if default:
+            value = input(f"{prompt} [{default}]: ") or default
+        else:
+            value = input(f"{prompt}: ")
+        if value:
+            return value
+
+
+def prompt_optional_secret(prompt: str, default: str) -> str:
+    if default:
+        value = input(f"{prompt} [keep existing, '-' to clear]: ")
+        if not value:
+            return default
+        if value == "-":
+            return ""
+        return value
+
+    return input(f"{prompt} [empty]: ")
+
+
+def prompt_url_or_disabled(prompt: str, default: str = "") -> str:
+    while True:
+        if default:
+            value = input(f"{prompt} [{default}; '-' to disable]: ") or default
+        else:
+            value = input(f"{prompt} ('-' to disable): ")
+
+        if value == "-":
+            return ""
+        if re.fullmatch(r"https?://.+", value):
+            return value
+        print("Please enter a full URL starting with http:// or https://, or '-' to disable.", file=sys.stderr)
+
+
+def prompt_time(prompt: str, default: str) -> str:
+    while True:
+        value = input(f"{prompt} [{default}]: ") or default
+        try:
+            return normalize_time_value(value, prompt)
+        except SystemExit:
+            print("Please enter time as HH:MM, from 00:00 to 23:59.", file=sys.stderr)
+
+
+def prompt_threshold(prompt: str, default: str) -> str:
+    while True:
+        value = input(f"{prompt} [{default}]: ") or default
+        try:
+            parse_threshold_free_percent(value)
+        except SystemExit:
+            print("Please enter a number from 0 to 100.", file=sys.stderr)
+            continue
+        return value
+
+
+def prompt_positive_integer(prompt: str, default: str) -> str:
+    while True:
+        value = input(f"{prompt} [{default}]: ") or default
+        if re.fullmatch(r"[1-9][0-9]*", value):
+            return value
+        print("Please enter a positive integer.", file=sys.stderr)
+
+
+def installer_disk_candidates(machine_name: str) -> list[dict[str, Any]]:
+    candidates = []
+    for index, usage in enumerate(collect_usages(), start=1):
+        mount_point = usage.mount.mount_point
+        candidates.append(
+            {
+                "number": index,
+                "mount_point": mount_point,
+                "message": format_message(usage, machine_name),
+                "default_blacklist": "/boot" in mount_point,
+            }
+        )
+    return candidates
+
+
+def append_unique_mount_point(mount_points: list[str], mount_point: str) -> None:
+    if mount_point and mount_point not in mount_points:
+        mount_points.append(mount_point)
+
+
+def select_installer_blacklist(
+    candidates: list[dict[str, Any]],
+    defaults: dict[str, Any],
+    existing_config_present: bool,
+) -> list[str]:
+    if not candidates:
+        print("No suitable local disks found for test messages.")
+        if existing_config_present:
+            return list(defaults["blacklist_mount_points"])
+        return []
+
+    print("Current test messages before blacklist:")
+    for candidate in candidates:
+        print(f"{candidate['number']}. {candidate['message']}")
+
+    if existing_config_present:
+        existing_mount_points = defaults["blacklist_mount_points"]
+        default_numbers = [
+            str(candidate["number"])
+            for candidate in candidates
+            if candidate["mount_point"] in existing_mount_points
+        ]
+        if default_numbers:
+            default_label = " ".join(default_numbers)
+        elif existing_mount_points:
+            default_label = "keep existing"
+        else:
+            default_label = "empty"
+    else:
+        existing_mount_points = []
+        default_numbers = [
+            str(candidate["number"])
+            for candidate in candidates
+            if candidate["default_blacklist"]
+        ]
+        default_label = " ".join(default_numbers) if default_numbers else "empty"
+
+    candidates_by_number = {candidate["number"]: candidate for candidate in candidates}
+    while True:
+        raw_numbers = input(f"Blacklist numbers [{default_label}]: ")
+        defaulted = not raw_numbers
+        if defaulted:
+            raw_numbers = " ".join(default_numbers)
+
+        mount_points: list[str] = []
+        if defaulted:
+            for mount_point in existing_mount_points:
+                append_unique_mount_point(mount_points, mount_point)
+
+        try:
+            for raw_number in raw_numbers.split():
+                if not raw_number.isdigit():
+                    raise ValueError(f"Invalid blacklist number: {raw_number}")
+                number = int(raw_number)
+                candidate = candidates_by_number.get(number)
+                if candidate is None:
+                    raise ValueError(f"Blacklist number out of range: {number}")
+                append_unique_mount_point(mount_points, str(candidate["mount_point"]))
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            continue
+
+        if mount_points:
+            print("Blacklisted mount points: " + ", ".join(mount_points))
+        else:
+            print("Blacklisted mount points: none")
+        return mount_points
+
+
+def configure_install(args: argparse.Namespace) -> int:
+    if not args.output_config or not args.output_timer_interval:
+        raise SystemExit("--output-config and --output-timer-interval are required with --configure-install")
+
+    existing_config_path = args.existing_config if args.existing_config is not None else args.config
+    existing_config_label = args.existing_config_label or existing_config_path
+    defaults, existing_config_present = load_installer_defaults(existing_config_path, existing_config_label)
+
+    print("Notification channels are optional. Enter '-' instead of the URL to disable ntfy or Mattermost.")
+    print("ntfy base URL example: https://ntfy-base-server.ru")
+    ntfy_base_url = prompt_url_or_disabled("ntfy base URL", defaults["ntfy_base_url"]).rstrip("/")
+
+    ntfy_topic = ""
+    ntfy_bearer_token = ""
+    if ntfy_base_url:
+        ntfy_topic = prompt_required("ntfy topic", defaults["ntfy_topic"]).strip("/")
+        print(
+            'Optional bearer token. Example: curl -H "Authorization: Bearer '
+            '78c5506d0740a58.........." -d "<Текст сообщения>" https://ntfy-base-server.ru/<topic>'
+        )
+        ntfy_bearer_token = prompt_optional_secret("ntfy bearer token", defaults["ntfy_bearer_token"])
+    else:
+        print("ntfy disabled.")
+
+    mattermost_default = defaults["mattermost_webhook_url"] or "-"
+    mattermost_webhook_url = prompt_url_or_disabled("Mattermost incoming webhook URL (optional)", mattermost_default)
+    if not mattermost_webhook_url:
+        print("Mattermost disabled.")
+
+    if not ntfy_base_url and not mattermost_webhook_url:
+        print("No notification channels enabled; generated alerts will be logged but not sent.")
+
+    host_machine_name = socket.getfqdn() or socket.gethostname()
+    default_machine_name = defaults["machine_name"] or host_machine_name
+    if default_machine_name:
+        machine_name = input(f"Machine name [{default_machine_name}]: ") or default_machine_name
+    else:
+        machine_name = input("Machine name: ")
+
+    threshold_free_percent = prompt_threshold(
+        "Alert when free space is below percent",
+        defaults["threshold_free_percent"],
+    )
+    notify_not_before = prompt_time("Do not notify before local time", defaults["notify_not_before"])
+    notify_not_after = prompt_time("Do not notify after local time", defaults["notify_not_after"])
+    timer_interval_hours = prompt_positive_integer("Run check every N hours", defaults["timer_interval_hours"])
+
+    print()
+    blacklist_mount_points = select_installer_blacklist(
+        installer_disk_candidates(machine_name),
+        defaults,
+        existing_config_present,
+    )
+
+    token = ntfy_bearer_token.strip()
+    config = {
+        "ntfy_base_url": ntfy_base_url.strip() or None,
+        "ntfy_topic": ntfy_topic.strip() or None,
+        "ntfy_bearer_token": token or None,
+        "mattermost_webhook_url": mattermost_webhook_url.strip() or None,
+        "machine_name": machine_name.strip(),
+        "threshold_free_percent": parse_threshold_free_percent(threshold_free_percent),
+        "notify_not_before": notify_not_before.strip(),
+        "notify_not_after": notify_not_after.strip(),
+        "timer_interval_hours": int(timer_interval_hours),
+        "blacklist": {
+            "mount_points": blacklist_mount_points,
+        },
+    }
+
+    Path(args.output_config).write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    Path(args.output_timer_interval).write_text(f"{timer_interval_hours}\n", encoding="utf-8")
+    return 0
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Check real local disks and send alerts when free space is below threshold."
@@ -537,11 +877,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test", action="store_true", help="Send a message for every selected disk, ignoring threshold.")
     parser.add_argument("--dry-run", action="store_true", help="Print messages instead of sending notifications.")
     parser.add_argument("--list-disks", action="store_true", help="Print selected local disks and exit.")
+    parser.add_argument("--configure-install", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--existing-config", help=argparse.SUPPRESS)
+    parser.add_argument("--existing-config-label", help=argparse.SUPPRESS)
+    parser.add_argument("--output-config", help=argparse.SUPPRESS)
+    parser.add_argument("--output-timer-interval", help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+
+    if args.configure_install:
+        return configure_install(args)
 
     if args.list_disks:
         config = load_config(args.config) if Path(args.config).exists() else {}
