@@ -4,6 +4,7 @@ set -euo pipefail
 APP_NAME="free-space-alarmer-ntfy"
 APP_DIR="/opt/${APP_NAME}"
 CONFIG_DIR="/etc/${APP_NAME}"
+STATE_DIR="/var/lib/${APP_NAME}"
 WRAPPER_BIN="/usr/local/bin/${APP_NAME}"
 SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
 TIMER_FILE="/etc/systemd/system/${APP_NAME}.timer"
@@ -18,7 +19,7 @@ fi
 "${SUDO[@]}" systemctl stop "${APP_NAME}.service" >/dev/null 2>&1 || true
 
 "${SUDO[@]}" rm -f "${SERVICE_FILE}" "${TIMER_FILE}" "${WRAPPER_BIN}"
-"${SUDO[@]}" rm -rf "${APP_DIR}" "${CONFIG_DIR}"
+"${SUDO[@]}" rm -rf "${APP_DIR}" "${CONFIG_DIR}" "${STATE_DIR}"
 "${SUDO[@]}" systemctl daemon-reload
 "${SUDO[@]}" systemctl reset-failed "${APP_NAME}.service" "${APP_NAME}.timer" >/dev/null 2>&1 || true
 

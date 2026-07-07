@@ -4,6 +4,7 @@ set -euo pipefail
 APP_NAME="free-space-alarmer-ntfy"
 APP_DIR="/opt/${APP_NAME}"
 CONFIG_DIR="/etc/${APP_NAME}"
+STATE_DIR="/var/lib/${APP_NAME}"
 CONFIG_FILE="${CONFIG_DIR}/config.json"
 WRAPPER_BIN="/usr/local/bin/${APP_NAME}"
 SERVICE_FILE="/etc/systemd/system/${APP_NAME}.service"
@@ -113,6 +114,7 @@ TIMER
 "${SUDO[@]}" install -Dm755 "${SOURCE_SCRIPT}" "${APP_DIR}/free_space_alarmer_ntfy.py"
 "${SUDO[@]}" install -Dm755 "${tmp_wrapper}" "${WRAPPER_BIN}"
 "${SUDO[@]}" install -Dm600 -o "${INSTALL_USER}" -g "${INSTALL_GROUP}" "${tmp_config}" "${CONFIG_FILE}"
+"${SUDO[@]}" install -d -m750 -o "${INSTALL_USER}" -g "${INSTALL_GROUP}" "${STATE_DIR}"
 "${SUDO[@]}" install -Dm644 "${tmp_service}" "${SERVICE_FILE}"
 "${SUDO[@]}" install -Dm644 "${tmp_timer}" "${TIMER_FILE}"
 

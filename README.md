@@ -54,6 +54,7 @@ chmod +x install.sh uninstall.sh free_space_alarmer_ntfy.py
 
 - `/opt/free-space-alarmer-ntfy/free_space_alarmer_ntfy.py`
 - `/etc/free-space-alarmer-ntfy/config.json`
+- `/var/lib/free-space-alarmer-ntfy/state.json`
 - `/usr/local/bin/free-space-alarmer-ntfy`
 - `free-space-alarmer-ntfy.service`
 - `free-space-alarmer-ntfy.timer`
@@ -74,6 +75,8 @@ chmod +x install.sh uninstall.sh free_space_alarmer_ntfy.py
   "notify_not_before": "10:00",
   "notify_not_after": "20:00",
   "timer_interval_hours": 1,
+  "repeat_alert_interval_hours": 24,
+  "alert_state_path": "/var/lib/free-space-alarmer-ntfy/state.json",
   "ssh": {
     "enabled": true,
     "config_file": "/home/user/.ssh/config",
@@ -89,6 +92,8 @@ chmod +x install.sh uninstall.sh free_space_alarmer_ntfy.py
 Если оба канала отключены, скрипт не отправляет уведомления наружу, но пишет сформированные сообщения в stdout/journal.
 
 `notify_not_before` и `notify_not_after` задаются в формате `HH:MM` и сравниваются с текущим локальным временем машины.
+
+`repeat_alert_interval_hours` ограничивает повторные уведомления по одному и тому же диску на одной и той же машине. По умолчанию повторный алерт отправляется не чаще одного раза в 24 часа. Время последней успешной отправки хранится в `alert_state_path`; когда диск снова становится выше порога, запись для него очищается.
 
 ## Тестовое сообщение
 

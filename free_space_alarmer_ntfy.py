@@ -20,17 +20,19 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 
 DEFAULT_CONFIG_PATH = "/etc/free-space-alarmer-ntfy/config.json"
+DEFAULT_ALERT_STATE_PATH = "/var/lib/free-space-alarmer-ntfy/state.json"
 DEFAULT_THRESHOLD_FREE_PERCENT = 10.0
 DEFAULT_THRESHOLD_FREE_PERCENT_TEXT = "10"
 DEFAULT_NOTIFY_NOT_BEFORE = "10:00"
 DEFAULT_NOTIFY_NOT_AFTER = "20:00"
 DEFAULT_TIMER_INTERVAL_HOURS = 1
+DEFAULT_REPEAT_ALERT_INTERVAL_HOURS = 24
 DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS = 10
 DEFAULT_SSH_COMMAND_TIMEOUT_SECONDS = 60
 GIB = 1024**3
@@ -163,6 +165,12 @@ class DiskUsage:
 class TargetDiskUsage:
     machine_name: str
     usage: DiskUsage
+
+
+@dataclass(frozen=True)
+class PendingAlert:
+    state_key: str | None
+    message: str
 
 
 def decode_mountinfo_field(value: str) -> str:
@@ -361,6 +369,12 @@ def load_config(path: str) -> dict[str, Any]:
     config["threshold_free_percent"] = parse_threshold_free_percent(
         config.get("threshold_free_percent", DEFAULT_THRESHOLD_FREE_PERCENT)
     )
+    config["repeat_alert_interval_hours"] = parse_positive_int_config(
+        config.get("repeat_alert_interval_hours"),
+        "repeat_alert_interval_hours",
+        DEFAULT_REPEAT_ALERT_INTERVAL_HOURS,
+    )
+    config["alert_state_path"] = string_config_value(config.get("alert_state_path")) or DEFAULT_ALERT_STATE_PATH
     config["notify_not_before"] = normalize_time_value(
         config.get("notify_not_before", DEFAULT_NOTIFY_NOT_BEFORE),
         "notify_not_before",
@@ -782,6 +796,127 @@ def is_within_notification_window(config: dict[str, Any]) -> bool:
     return current_minutes >= not_before or current_minutes <= not_after
 
 
+def alert_state_key(target_usage: TargetDiskUsage) -> str:
+    mount = target_usage.usage.mount
+    return f"{target_usage.machine_name}|{mount.source}|{mount.mount_point}"
+
+
+def load_alert_state(path: Path) -> dict[str, Any]:
+    try:
+        with path.open(encoding="utf-8") as state_file:
+            state = json.load(state_file)
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        print(f"Cannot read alert state {path}: {exc}", file=sys.stderr)
+        return {}
+    except json.JSONDecodeError as exc:
+        print(f"Invalid JSON in alert state {path}: {exc}", file=sys.stderr)
+        return {}
+
+    if not isinstance(state, dict):
+        print(f"Invalid alert state {path}: top-level JSON value is not an object.", file=sys.stderr)
+        return {}
+    return state
+
+
+def save_alert_state(path: Path, state: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    tmp_path.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
+def save_alert_state_or_warn(path: Path, state: dict[str, Any]) -> None:
+    try:
+        save_alert_state(path, state)
+    except OSError as exc:
+        print(f"Cannot save alert state {path}: {exc}", file=sys.stderr)
+
+
+def state_last_sent_at(value: Any) -> datetime | None:
+    if isinstance(value, dict):
+        value = value.get("last_sent_at")
+    if not isinstance(value, str) or not value.strip():
+        return None
+
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+
+    try:
+        timestamp = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+    if timestamp.tzinfo is None:
+        return timestamp.astimezone()
+    return timestamp
+
+
+def is_repeated_alert_suppressed(
+    state: dict[str, Any],
+    state_key: str,
+    now: datetime,
+    interval_hours: int,
+) -> bool:
+    last_sent_at = state_last_sent_at(state.get(state_key))
+    if last_sent_at is None:
+        return False
+    return now - last_sent_at < timedelta(hours=interval_hours)
+
+
+def update_resolved_alert_state(
+    state: dict[str, Any],
+    target_usages: list[TargetDiskUsage],
+    threshold: float,
+) -> bool:
+    changed = False
+    for target_usage in target_usages:
+        if target_usage.usage.free_percent < threshold:
+            continue
+        state_key = alert_state_key(target_usage)
+        if state_key in state:
+            del state[state_key]
+            changed = True
+    return changed
+
+
+def filter_repeated_alerts(
+    target_usages: list[TargetDiskUsage],
+    config: dict[str, Any],
+    threshold: float,
+    *,
+    dry_run: bool,
+) -> tuple[list[PendingAlert], dict[str, Any], Path]:
+    state_path = Path(str(config.get("alert_state_path") or DEFAULT_ALERT_STATE_PATH)).expanduser()
+    state = load_alert_state(state_path)
+    state_changed = update_resolved_alert_state(state, target_usages, threshold)
+    if state_changed and not dry_run:
+        save_alert_state_or_warn(state_path, state)
+
+    now = datetime.now().astimezone()
+    interval_hours = int(config.get("repeat_alert_interval_hours", DEFAULT_REPEAT_ALERT_INTERVAL_HOURS))
+    alerts: list[PendingAlert] = []
+    for target_usage in target_usages:
+        if target_usage.usage.free_percent >= threshold:
+            continue
+
+        state_key = alert_state_key(target_usage)
+        if is_repeated_alert_suppressed(state, state_key, now, interval_hours):
+            if dry_run:
+                print(
+                    f"Suppressed repeated alert for {target_usage.machine_name}: "
+                    f"{disk_label(target_usage.usage.mount)}; "
+                    f"last sent less than {interval_hours}h ago."
+                )
+            continue
+
+        alerts.append(PendingAlert(state_key, format_message(target_usage.usage, target_usage.machine_name)))
+
+    return alerts, state, state_path
+
+
 def run(config: dict[str, Any], *, test_mode: bool, dry_run: bool) -> int:
     threshold = float(config.get("threshold_free_percent", DEFAULT_THRESHOLD_FREE_PERCENT))
 
@@ -797,28 +932,36 @@ def run(config: dict[str, Any], *, test_mode: bool, dry_run: bool) -> int:
     target_usages = collect_target_usages(config)
 
     if test_mode:
-        messages = [format_message(target_usage.usage, target_usage.machine_name) for target_usage in target_usages]
-    else:
-        messages = [
-            format_message(target_usage.usage, target_usage.machine_name)
+        alerts = [
+            PendingAlert(None, format_message(target_usage.usage, target_usage.machine_name))
             for target_usage in target_usages
-            if target_usage.usage.free_percent < threshold
         ]
+    else:
+        alerts, alert_state, alert_state_path = filter_repeated_alerts(
+            target_usages,
+            config,
+            threshold,
+            dry_run=dry_run,
+        )
 
-    if messages and not dry_run and not has_notification_channel(config):
+    if alerts and not dry_run and not has_notification_channel(config):
         print("No notification channels configured; no messages sent.", file=sys.stderr)
-        for message in messages:
-            print(message)
+        for alert in alerts:
+            print(alert.message)
         return 0
 
-    for message in messages:
+    now = datetime.now().astimezone()
+    for alert in alerts:
         if dry_run:
-            print(message)
+            print(alert.message)
             continue
-        send_notification_message(message, config)
-        print(message)
+        send_notification_message(alert.message, config)
+        if not test_mode and alert.state_key is not None:
+            alert_state[alert.state_key] = {"last_sent_at": now.isoformat(timespec="seconds")}
+            save_alert_state_or_warn(alert_state_path, alert_state)
+        print(alert.message)
 
-    if not messages and dry_run:
+    if not alerts and dry_run:
         print("No alerts to send.")
 
     return 0
@@ -857,6 +1000,13 @@ def installer_timer_interval_default(value: Any) -> str:
     return str(DEFAULT_TIMER_INTERVAL_HOURS)
 
 
+def installer_repeat_alert_interval_default(value: Any) -> str:
+    text = string_config_value(value)
+    if re.fullmatch(r"[1-9][0-9]*", text):
+        return text
+    return str(DEFAULT_REPEAT_ALERT_INTERVAL_HOURS)
+
+
 def installer_blacklist_mount_points(config: dict[str, Any]) -> list[str]:
     blacklist = config.get("blacklist", {})
     if not isinstance(blacklist, dict):
@@ -885,6 +1035,8 @@ def installer_default_values() -> dict[str, Any]:
         "notify_not_before": DEFAULT_NOTIFY_NOT_BEFORE,
         "notify_not_after": DEFAULT_NOTIFY_NOT_AFTER,
         "timer_interval_hours": str(DEFAULT_TIMER_INTERVAL_HOURS),
+        "repeat_alert_interval_hours": str(DEFAULT_REPEAT_ALERT_INTERVAL_HOURS),
+        "alert_state_path": DEFAULT_ALERT_STATE_PATH,
         "blacklist_mount_points": [],
         "ssh_enabled": False,
         "ssh_config_file": str(Path.home() / ".ssh/config"),
@@ -930,6 +1082,10 @@ def load_installer_defaults(config_path: str, label: str) -> tuple[dict[str, Any
             "timer_interval_hours": installer_timer_interval_default(
                 config.get("timer_interval_hours", DEFAULT_TIMER_INTERVAL_HOURS)
             ),
+            "repeat_alert_interval_hours": installer_repeat_alert_interval_default(
+                config.get("repeat_alert_interval_hours", DEFAULT_REPEAT_ALERT_INTERVAL_HOURS)
+            ),
+            "alert_state_path": string_config_value(config.get("alert_state_path")) or DEFAULT_ALERT_STATE_PATH,
             "blacklist_mount_points": installer_blacklist_mount_points(config),
             "ssh_enabled": bool(ssh_settings["enabled"]),
             "ssh_config_file": string_config_value(ssh_settings["config_file"]),
@@ -1191,6 +1347,10 @@ def configure_install(args: argparse.Namespace) -> int:
     notify_not_before = prompt_time("Do not notify before local time", defaults["notify_not_before"])
     notify_not_after = prompt_time("Do not notify after local time", defaults["notify_not_after"])
     timer_interval_hours = prompt_positive_integer("Run check every N hours", defaults["timer_interval_hours"])
+    repeat_alert_interval_hours = prompt_positive_integer(
+        "Repeat the same disk alert no more often than every N hours",
+        defaults["repeat_alert_interval_hours"],
+    )
     ssh_config_file = args.ssh_config or defaults["ssh_config_file"]
     ssh_enabled = prompt_ssh_enabled(ssh_config_file, args.ssh_home, bool(defaults["ssh_enabled"]))
 
@@ -1214,6 +1374,8 @@ def configure_install(args: argparse.Namespace) -> int:
         "notify_not_before": notify_not_before.strip(),
         "notify_not_after": notify_not_after.strip(),
         "timer_interval_hours": int(timer_interval_hours),
+        "repeat_alert_interval_hours": int(repeat_alert_interval_hours),
+        "alert_state_path": defaults["alert_state_path"],
         "ssh": {
             "enabled": ssh_enabled,
             "config_file": ssh_config_file,
