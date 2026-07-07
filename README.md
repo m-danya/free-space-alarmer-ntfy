@@ -43,12 +43,14 @@ chmod +x install.sh uninstall.sh free_space_alarmer_ntfy.py
 - время, раньше которого не отправлять уведомления, по умолчанию `10:00`
 - время, позже которого не отправлять уведомления, по умолчанию `20:00`
 - период проверки в часах, по умолчанию `1`
+- период повторного алерта по той же проблеме в часах, по умолчанию `24`
 - `Check disks on SSH hosts from your config?`; перед вопросом инсталлер перечислит конкретные `Host`-алиасы из `~/.ssh/config`
+- `Alert if an SSH host is unavailable?`, если SSH-обход включен; по умолчанию `N`
 - номера дисков для blacklist; перед этим инсталлер покажет test-сообщения по всем найденным дискам
 
 Для ntfy и Mattermost можно ввести `-` вместо URL, чтобы отключить канал. У ntfy дефолт берется из существующего конфига, если он есть. У Mattermost по умолчанию выбран `-`, то есть канал отключен.
 
-Для SSH берутся конкретные `Host` из ssh config пользователя-установщика. Wildcard-записи вроде `Host *` или `Host prod-*` не перечисляются. Systemd-сервис запускается от пользователя, который запускал установку, чтобы `ssh` использовал его config, ключи и `known_hosts`.
+Для SSH берутся конкретные `Host` из ssh config пользователя-установщика. Wildcard-записи вроде `Host *` или `Host prod-*` не перечисляются. Systemd-сервис запускается от пользователя, который запускал установку, чтобы `ssh` использовал его config, ключи и `known_hosts`. Если включить алерт о недоступности SSH-хоста, он ограничивается тем же `repeat_alert_interval_hours`, что и повторные алерты по дискам; когда хост снова успешно отвечает, запись в state очищается.
 
 После установки создаются:
 
@@ -79,6 +81,7 @@ chmod +x install.sh uninstall.sh free_space_alarmer_ntfy.py
   "alert_state_path": "/var/lib/free-space-alarmer-ntfy/state.json",
   "ssh": {
     "enabled": true,
+    "alert_unavailable": false,
     "config_file": "/home/user/.ssh/config",
     "connect_timeout_seconds": 10,
     "command_timeout_seconds": 60

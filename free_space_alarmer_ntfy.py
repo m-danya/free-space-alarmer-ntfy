@@ -173,6 +173,25 @@ class PendingAlert:
     message: str
 
 
+@dataclass(frozen=True)
+class UnavailableHost:
+    host: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class SshProbeResult:
+    usages: list[DiskUsage]
+    unavailable_host: UnavailableHost | None = None
+
+
+@dataclass(frozen=True)
+class TargetCollection:
+    usages: list[TargetDiskUsage]
+    unavailable_hosts: list[UnavailableHost]
+    reachable_ssh_hosts: list[str]
+
+
 def decode_mountinfo_field(value: str) -> str:
     return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), value)
 
@@ -445,6 +464,22 @@ def parse_positive_int_config(value: Any, field_name: str, default: int) -> int:
     raise SystemExit(f"Invalid config: {field_name} must be a positive integer")
 
 
+def parse_bool_config(value: Any, field_name: str, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+
+    text = string_config_value(value).lower()
+    if text in {"1", "true", "yes", "y", "on", "да", "д"}:
+        return True
+    if text in {"0", "false", "no", "n", "off", "нет", "н"}:
+        return False
+    raise SystemExit(f"Invalid config: {field_name} must be a boolean")
+
+
 def split_ssh_config_line(line: str) -> list[str]:
     try:
         tokens = shlex.split(line, comments=True, posix=True)
@@ -535,9 +570,10 @@ def normalize_ssh_settings(value: Any) -> dict[str, Any]:
         raise SystemExit("Invalid config: ssh must be an object")
 
     config_file = string_config_value(value.get("config_file")) or str(Path.home() / ".ssh/config")
-    enabled = bool(value.get("enabled", False))
+    enabled = parse_bool_config(value.get("enabled"), "ssh.enabled", False)
     return {
         "enabled": enabled,
+        "alert_unavailable": parse_bool_config(value.get("alert_unavailable"), "ssh.alert_unavailable", False),
         "config_file": config_file,
         "connect_timeout_seconds": parse_positive_int_config(
             value.get("connect_timeout_seconds"),
@@ -693,7 +729,19 @@ def ssh_command_for_host(host: str, ssh_config: dict[str, Any]) -> list[str]:
     return command
 
 
-def collect_ssh_usages(host: str, config: dict[str, Any], source: bytes) -> list[DiskUsage]:
+def compact_error_detail(value: str, max_length: int = 300) -> str:
+    text = re.sub(r"\s+", " ", value).strip()
+    if len(text) <= max_length:
+        return text
+    return text[: max_length - 3].rstrip() + "..."
+
+
+def unavailable_probe_result(host: str, reason: str) -> SshProbeResult:
+    print(f"Cannot collect SSH disk usages from {host}: {reason}", file=sys.stderr)
+    return SshProbeResult([], UnavailableHost(host, compact_error_detail(reason)))
+
+
+def collect_ssh_usages(host: str, config: dict[str, Any], source: bytes) -> SshProbeResult:
     ssh_config = config["ssh"]
     try:
         process = subprocess.run(
@@ -705,18 +753,15 @@ def collect_ssh_usages(host: str, config: dict[str, Any], source: bytes) -> list
             check=False,
         )
     except subprocess.TimeoutExpired:
-        print(f"Cannot collect SSH disk usages from {host}: command timed out.", file=sys.stderr)
-        return []
+        return unavailable_probe_result(host, "command timed out")
     except OSError as exc:
-        print(f"Cannot collect SSH disk usages from {host}: {exc}", file=sys.stderr)
-        return []
+        return unavailable_probe_result(host, str(exc))
 
     stdout = process.stdout.decode("utf-8", errors="replace")
     stderr = process.stderr.decode("utf-8", errors="replace").strip()
     if process.returncode != 0:
-        details = stderr or stdout.strip() or "no output"
-        print(f"Cannot collect SSH disk usages from {host}: ssh exited {process.returncode}: {details}", file=sys.stderr)
-        return []
+        details = compact_error_detail(stderr or stdout.strip() or "no output")
+        return unavailable_probe_result(host, f"ssh exited {process.returncode}: {details}")
 
     if stderr:
         print(f"SSH disk probe stderr from {host}: {stderr}", file=sys.stderr)
@@ -724,18 +769,16 @@ def collect_ssh_usages(host: str, config: dict[str, Any], source: bytes) -> list
     try:
         values = json.loads(stdout)
     except json.JSONDecodeError as exc:
-        print(f"Cannot collect SSH disk usages from {host}: invalid probe JSON: {exc}", file=sys.stderr)
-        return []
+        return unavailable_probe_result(host, f"invalid probe JSON: {exc}")
 
     if not isinstance(values, list):
-        print(f"Cannot collect SSH disk usages from {host}: probe JSON is not a list.", file=sys.stderr)
-        return []
+        return unavailable_probe_result(host, "probe JSON is not a list")
 
     usages: list[DiskUsage] = []
     for value in values:
         if isinstance(value, dict):
             usages.append(usage_from_json_value(value))
-    return filter_usages(usages, config)
+    return SshProbeResult(filter_usages(usages, config))
 
 
 def ssh_hosts_from_config(config: dict[str, Any]) -> list[str]:
@@ -749,26 +792,39 @@ def ssh_hosts_from_config(config: dict[str, Any]) -> list[str]:
     return [str(host) for host in hosts if str(host).strip()]
 
 
-def collect_target_usages(config: dict[str, Any]) -> list[TargetDiskUsage]:
+def collect_target_collection(config: dict[str, Any]) -> TargetCollection:
     machine_name = str(config.get("machine_name") or socket.gethostname())
     target_usages = [TargetDiskUsage(machine_name, usage) for usage in collect_usages(config)]
     ssh_hosts = ssh_hosts_from_config(config)
     if not ssh_hosts:
-        return target_usages
+        return TargetCollection(target_usages, [], [])
 
     if shutil.which("ssh") is None:
         print("Cannot collect SSH disk usages: ssh command not found.", file=sys.stderr)
-        return target_usages
+        unavailable_hosts = [UnavailableHost(host, "ssh command not found") for host in ssh_hosts]
+        return TargetCollection(target_usages, unavailable_hosts, [])
 
     try:
         source = script_source_bytes()
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
-        return target_usages
+        unavailable_hosts = [UnavailableHost(host, compact_error_detail(str(exc))) for host in ssh_hosts]
+        return TargetCollection(target_usages, unavailable_hosts, [])
 
+    unavailable_hosts: list[UnavailableHost] = []
+    reachable_ssh_hosts: list[str] = []
     for host in ssh_hosts:
-        target_usages.extend(TargetDiskUsage(host, usage) for usage in collect_ssh_usages(host, config, source))
-    return target_usages
+        probe_result = collect_ssh_usages(host, config, source)
+        if probe_result.unavailable_host is not None:
+            unavailable_hosts.append(probe_result.unavailable_host)
+            continue
+        reachable_ssh_hosts.append(host)
+        target_usages.extend(TargetDiskUsage(host, usage) for usage in probe_result.usages)
+    return TargetCollection(target_usages, unavailable_hosts, reachable_ssh_hosts)
+
+
+def collect_target_usages(config: dict[str, Any]) -> list[TargetDiskUsage]:
+    return collect_target_collection(config).usages
 
 
 def print_mounts(target_usages: list[TargetDiskUsage]) -> None:
@@ -799,6 +855,17 @@ def is_within_notification_window(config: dict[str, Any]) -> bool:
 def alert_state_key(target_usage: TargetDiskUsage) -> str:
     mount = target_usage.usage.mount
     return f"{target_usage.machine_name}|{mount.source}|{mount.mount_point}"
+
+
+def unavailable_host_state_key(host: str) -> str:
+    return f"ssh-unavailable|{host}"
+
+
+def format_unavailable_host_message(unavailable_host: UnavailableHost) -> str:
+    return (
+        f"🚨 Машина **{unavailable_host.host}** недоступна для проверки свободного места: "
+        f"{unavailable_host.reason}"
+    )
 
 
 def load_alert_state(path: Path) -> dict[str, Any]:
@@ -870,6 +937,7 @@ def update_resolved_alert_state(
     state: dict[str, Any],
     target_usages: list[TargetDiskUsage],
     threshold: float,
+    reachable_ssh_hosts: list[str],
 ) -> bool:
     changed = False
     for target_usage in target_usages:
@@ -879,11 +947,18 @@ def update_resolved_alert_state(
         if state_key in state:
             del state[state_key]
             changed = True
+
+    for host in reachable_ssh_hosts:
+        state_key = unavailable_host_state_key(host)
+        if state_key in state:
+            del state[state_key]
+            changed = True
+
     return changed
 
 
 def filter_repeated_alerts(
-    target_usages: list[TargetDiskUsage],
+    collection: TargetCollection,
     config: dict[str, Any],
     threshold: float,
     *,
@@ -891,14 +966,19 @@ def filter_repeated_alerts(
 ) -> tuple[list[PendingAlert], dict[str, Any], Path]:
     state_path = Path(str(config.get("alert_state_path") or DEFAULT_ALERT_STATE_PATH)).expanduser()
     state = load_alert_state(state_path)
-    state_changed = update_resolved_alert_state(state, target_usages, threshold)
+    state_changed = update_resolved_alert_state(
+        state,
+        collection.usages,
+        threshold,
+        collection.reachable_ssh_hosts,
+    )
     if state_changed and not dry_run:
         save_alert_state_or_warn(state_path, state)
 
     now = datetime.now().astimezone()
     interval_hours = int(config.get("repeat_alert_interval_hours", DEFAULT_REPEAT_ALERT_INTERVAL_HOURS))
     alerts: list[PendingAlert] = []
-    for target_usage in target_usages:
+    for target_usage in collection.usages:
         if target_usage.usage.free_percent >= threshold:
             continue
 
@@ -913,6 +993,21 @@ def filter_repeated_alerts(
             continue
 
         alerts.append(PendingAlert(state_key, format_message(target_usage.usage, target_usage.machine_name)))
+
+    ssh_config = config.get("ssh", {})
+    alert_unavailable = isinstance(ssh_config, dict) and bool(ssh_config.get("alert_unavailable", False))
+    if alert_unavailable:
+        for unavailable_host in collection.unavailable_hosts:
+            state_key = unavailable_host_state_key(unavailable_host.host)
+            if is_repeated_alert_suppressed(state, state_key, now, interval_hours):
+                if dry_run:
+                    print(
+                        f"Suppressed repeated unavailable-host alert for {unavailable_host.host}; "
+                        f"last sent less than {interval_hours}h ago."
+                    )
+                continue
+
+            alerts.append(PendingAlert(state_key, format_unavailable_host_message(unavailable_host)))
 
     return alerts, state, state_path
 
@@ -929,16 +1024,22 @@ def run(config: dict[str, Any], *, test_mode: bool, dry_run: bool) -> int:
             )
         return 0
 
-    target_usages = collect_target_usages(config)
+    collection = collect_target_collection(config)
 
     if test_mode:
         alerts = [
             PendingAlert(None, format_message(target_usage.usage, target_usage.machine_name))
-            for target_usage in target_usages
+            for target_usage in collection.usages
         ]
+        ssh_config = config.get("ssh", {})
+        if isinstance(ssh_config, dict) and ssh_config.get("alert_unavailable"):
+            alerts.extend(
+                PendingAlert(None, format_unavailable_host_message(unavailable_host))
+                for unavailable_host in collection.unavailable_hosts
+            )
     else:
         alerts, alert_state, alert_state_path = filter_repeated_alerts(
-            target_usages,
+            collection,
             config,
             threshold,
             dry_run=dry_run,
@@ -1039,6 +1140,7 @@ def installer_default_values() -> dict[str, Any]:
         "alert_state_path": DEFAULT_ALERT_STATE_PATH,
         "blacklist_mount_points": [],
         "ssh_enabled": False,
+        "ssh_alert_unavailable": False,
         "ssh_config_file": str(Path.home() / ".ssh/config"),
     }
 
@@ -1088,6 +1190,7 @@ def load_installer_defaults(config_path: str, label: str) -> tuple[dict[str, Any
             "alert_state_path": string_config_value(config.get("alert_state_path")) or DEFAULT_ALERT_STATE_PATH,
             "blacklist_mount_points": installer_blacklist_mount_points(config),
             "ssh_enabled": bool(ssh_settings["enabled"]),
+            "ssh_alert_unavailable": bool(ssh_settings["alert_unavailable"]),
             "ssh_config_file": string_config_value(ssh_settings["config_file"]),
         }
     )
@@ -1353,6 +1456,12 @@ def configure_install(args: argparse.Namespace) -> int:
     )
     ssh_config_file = args.ssh_config or defaults["ssh_config_file"]
     ssh_enabled = prompt_ssh_enabled(ssh_config_file, args.ssh_home, bool(defaults["ssh_enabled"]))
+    ssh_alert_unavailable = False
+    if ssh_enabled:
+        ssh_alert_unavailable = prompt_yes_no(
+            "Alert if an SSH host is unavailable?",
+            bool(defaults["ssh_alert_unavailable"]),
+        )
 
     print()
     if ssh_enabled:
@@ -1378,6 +1487,7 @@ def configure_install(args: argparse.Namespace) -> int:
         "alert_state_path": defaults["alert_state_path"],
         "ssh": {
             "enabled": ssh_enabled,
+            "alert_unavailable": ssh_alert_unavailable,
             "config_file": ssh_config_file,
             "connect_timeout_seconds": DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS,
             "command_timeout_seconds": DEFAULT_SSH_COMMAND_TIMEOUT_SECONDS,
@@ -1397,7 +1507,11 @@ def parse_args() -> argparse.Namespace:
         description="Check real local disks and send alerts when free space is below threshold."
     )
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help=f"Config path, default: {DEFAULT_CONFIG_PATH}")
-    parser.add_argument("--test", action="store_true", help="Send a message for every selected disk, ignoring threshold.")
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Send test messages for selected disks and configured SSH availability alerts, ignoring threshold.",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print messages instead of sending notifications.")
     parser.add_argument("--list-disks", action="store_true", help="Print selected disks and exit.")
     parser.add_argument("--probe-json", action="store_true", help=argparse.SUPPRESS)
