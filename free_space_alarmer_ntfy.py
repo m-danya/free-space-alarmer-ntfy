@@ -6,11 +6,15 @@
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import math
 import os
 import re
+import shlex
+import shutil
 import socket
+import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -27,6 +31,8 @@ DEFAULT_THRESHOLD_FREE_PERCENT_TEXT = "10"
 DEFAULT_NOTIFY_NOT_BEFORE = "10:00"
 DEFAULT_NOTIFY_NOT_AFTER = "20:00"
 DEFAULT_TIMER_INTERVAL_HOURS = 1
+DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS = 10
+DEFAULT_SSH_COMMAND_TIMEOUT_SECONDS = 60
 GIB = 1024**3
 TIME_VALUE_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
@@ -153,6 +159,12 @@ class DiskUsage:
         return self.available_bytes / GIB
 
 
+@dataclass(frozen=True)
+class TargetDiskUsage:
+    machine_name: str
+    usage: DiskUsage
+
+
 def decode_mountinfo_field(value: str) -> str:
     return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), value)
 
@@ -259,12 +271,77 @@ def get_disk_usage(mount: MountEntry) -> DiskUsage | None:
     return DiskUsage(mount=mount, total_bytes=total_bytes, available_bytes=available_bytes)
 
 
+def collect_all_usages() -> list[DiskUsage]:
+    usages: list[DiskUsage] = []
+    for mount in selected_mounts():
+        usage = get_disk_usage(mount)
+        if usage is not None:
+            usages.append(usage)
+    return usages
+
+
+def mount_to_json_value(mount: MountEntry) -> dict[str, Any]:
+    return {
+        "device_id": mount.device_id,
+        "root": mount.root,
+        "mount_point": mount.mount_point,
+        "fs_type": mount.fs_type,
+        "source": mount.source,
+        "options": sorted(mount.options),
+    }
+
+
+def usage_to_json_value(usage: DiskUsage) -> dict[str, Any]:
+    return {
+        "mount": mount_to_json_value(usage.mount),
+        "total_bytes": usage.total_bytes,
+        "available_bytes": usage.available_bytes,
+    }
+
+
+def mount_from_json_value(value: dict[str, Any]) -> MountEntry:
+    options = value.get("options", [])
+    if not isinstance(options, list):
+        options = []
+    return MountEntry(
+        device_id=str(value.get("device_id", "")),
+        root=str(value.get("root", "")),
+        mount_point=str(value.get("mount_point", "")),
+        fs_type=str(value.get("fs_type", "")),
+        source=str(value.get("source", "")),
+        options=frozenset(str(option) for option in options),
+    )
+
+
+def usage_from_json_value(value: dict[str, Any]) -> DiskUsage:
+    mount = value.get("mount", {})
+    if not isinstance(mount, dict):
+        mount = {}
+    return DiskUsage(
+        mount=mount_from_json_value(mount),
+        total_bytes=int(value.get("total_bytes", 0)),
+        available_bytes=int(value.get("available_bytes", 0)),
+    )
+
+
+def print_probe_json() -> int:
+    json.dump(
+        [usage_to_json_value(usage) for usage in collect_all_usages()],
+        sys.stdout,
+        ensure_ascii=False,
+    )
+    sys.stdout.write("\n")
+    return 0
+
+
 def load_config(path: str) -> dict[str, Any]:
     try:
         with open(path, encoding="utf-8") as config_file:
             config = json.load(config_file)
     except FileNotFoundError:
         raise SystemExit(f"Config file not found: {path}") from None
+    except OSError as exc:
+        raise SystemExit(f"Cannot read config file {path}: {exc}") from None
     except json.JSONDecodeError as exc:
         raise SystemExit(f"Invalid JSON in {path}: {exc}") from None
 
@@ -292,6 +369,7 @@ def load_config(path: str) -> dict[str, Any]:
         config.get("notify_not_after", DEFAULT_NOTIFY_NOT_AFTER),
         "notify_not_after",
     )
+    config["ssh"] = normalize_ssh_settings(config.get("ssh"))
     config.setdefault("blacklist", {"mount_points": []})
     return config
 
@@ -342,6 +420,123 @@ def parse_time_value(value: Any, field_name: str) -> int:
 def normalize_time_value(value: Any, field_name: str) -> str:
     minutes = parse_time_value(value, field_name)
     return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def parse_positive_int_config(value: Any, field_name: str, default: int) -> int:
+    text = string_config_value(value)
+    if not text:
+        return default
+    if re.fullmatch(r"[1-9][0-9]*", text):
+        return int(text)
+    raise SystemExit(f"Invalid config: {field_name} must be a positive integer")
+
+
+def split_ssh_config_line(line: str) -> list[str]:
+    try:
+        tokens = shlex.split(line, comments=True, posix=True)
+    except ValueError:
+        tokens = line.split()
+
+    if not tokens:
+        return []
+
+    key, separator, value = tokens[0].partition("=")
+    if separator:
+        return [key, value, *tokens[1:]] if value else [key, *tokens[1:]]
+    return tokens
+
+
+def expand_ssh_path(value: str, home_dir: Path) -> Path:
+    expanded = os.path.expandvars(value)
+    if expanded == "~":
+        return home_dir
+    if expanded.startswith("~/"):
+        return home_dir / expanded[2:]
+    return Path(expanded).expanduser()
+
+
+def resolve_ssh_include(pattern: str, base_dir: Path, home_dir: Path) -> list[Path]:
+    expanded = os.path.expandvars(pattern)
+    include_path = expand_ssh_path(expanded, home_dir)
+
+    if not include_path.is_absolute():
+        include_path = base_dir / include_path
+
+    return [Path(match) for match in sorted(glob.glob(str(include_path)))]
+
+
+def is_concrete_ssh_host(pattern: str) -> bool:
+    if not pattern or pattern.startswith("!") or pattern.startswith("-"):
+        return False
+    return not any(char in pattern for char in "*?[]")
+
+
+def read_ssh_config_hosts(path: Path, visited: set[Path], home_dir: Path) -> list[str]:
+    try:
+        resolved_path = path.resolve()
+    except OSError:
+        resolved_path = path
+
+    if resolved_path in visited or not path.is_file():
+        return []
+    visited.add(resolved_path)
+
+    hosts: list[str] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+
+    for line in lines:
+        tokens = split_ssh_config_line(line)
+        if not tokens:
+            continue
+
+        keyword = tokens[0].lower()
+        values = tokens[1:]
+        if keyword == "include":
+            for include_pattern in values:
+                for include_path in resolve_ssh_include(include_pattern, path.parent, home_dir):
+                    hosts.extend(read_ssh_config_hosts(include_path, visited, home_dir))
+        elif keyword == "host":
+            hosts.extend(pattern for pattern in values if is_concrete_ssh_host(pattern))
+
+    return hosts
+
+
+def ssh_config_hosts(config_file: str | None, home_dir: str | None = None) -> list[str]:
+    ssh_home = Path(home_dir).expanduser() if home_dir else Path.home()
+    config_path = expand_ssh_path(config_file, ssh_home) if config_file else ssh_home / ".ssh/config"
+    hosts: list[str] = []
+    for host in read_ssh_config_hosts(config_path, set(), ssh_home):
+        if host not in hosts:
+            hosts.append(host)
+    return hosts
+
+
+def normalize_ssh_settings(value: Any) -> dict[str, Any]:
+    if value is None:
+        value = {}
+    if not isinstance(value, dict):
+        raise SystemExit("Invalid config: ssh must be an object")
+
+    config_file = string_config_value(value.get("config_file")) or str(Path.home() / ".ssh/config")
+    enabled = bool(value.get("enabled", False))
+    return {
+        "enabled": enabled,
+        "config_file": config_file,
+        "connect_timeout_seconds": parse_positive_int_config(
+            value.get("connect_timeout_seconds"),
+            "ssh.connect_timeout_seconds",
+            DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS,
+        ),
+        "command_timeout_seconds": parse_positive_int_config(
+            value.get("command_timeout_seconds"),
+            "ssh.command_timeout_seconds",
+            DEFAULT_SSH_COMMAND_TIMEOUT_SECONDS,
+        ),
+        "hosts": ssh_config_hosts(config_file) if enabled else [],
+    }
 
 
 def blacklisted_mount_points(config: dict[str, Any] | None) -> set[str]:
@@ -453,25 +648,124 @@ def send_notification_message(message: str, config: dict[str, Any]) -> None:
         raise RuntimeError("Notification send failed: " + "; ".join(errors))
 
 
+def filter_usages(usages: list[DiskUsage], config: dict[str, Any] | None = None) -> list[DiskUsage]:
+    return [usage for usage in usages if not is_blacklisted(usage.mount, config)]
+
+
 def collect_usages(config: dict[str, Any] | None = None) -> list[DiskUsage]:
+    return filter_usages(collect_all_usages(), config)
+
+
+def script_source_bytes() -> bytes:
+    try:
+        return Path(__file__).read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f"Cannot read script source for SSH probe: {exc}") from exc
+
+
+def ssh_command_for_host(host: str, ssh_config: dict[str, Any]) -> list[str]:
+    command = [
+        "ssh",
+        "-T",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        f"ConnectTimeout={ssh_config['connect_timeout_seconds']}",
+    ]
+    config_file = string_config_value(ssh_config.get("config_file"))
+    if config_file:
+        command.extend(["-F", config_file])
+    command.extend([host, "python3", "-", "--probe-json"])
+    return command
+
+
+def collect_ssh_usages(host: str, config: dict[str, Any], source: bytes) -> list[DiskUsage]:
+    ssh_config = config["ssh"]
+    try:
+        process = subprocess.run(
+            ssh_command_for_host(host, ssh_config),
+            input=source,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=int(ssh_config["command_timeout_seconds"]),
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"Cannot collect SSH disk usages from {host}: command timed out.", file=sys.stderr)
+        return []
+    except OSError as exc:
+        print(f"Cannot collect SSH disk usages from {host}: {exc}", file=sys.stderr)
+        return []
+
+    stdout = process.stdout.decode("utf-8", errors="replace")
+    stderr = process.stderr.decode("utf-8", errors="replace").strip()
+    if process.returncode != 0:
+        details = stderr or stdout.strip() or "no output"
+        print(f"Cannot collect SSH disk usages from {host}: ssh exited {process.returncode}: {details}", file=sys.stderr)
+        return []
+
+    if stderr:
+        print(f"SSH disk probe stderr from {host}: {stderr}", file=sys.stderr)
+
+    try:
+        values = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        print(f"Cannot collect SSH disk usages from {host}: invalid probe JSON: {exc}", file=sys.stderr)
+        return []
+
+    if not isinstance(values, list):
+        print(f"Cannot collect SSH disk usages from {host}: probe JSON is not a list.", file=sys.stderr)
+        return []
+
     usages: list[DiskUsage] = []
-    for mount in selected_mounts():
-        if is_blacklisted(mount, config):
-            continue
-        usage = get_disk_usage(mount)
-        if usage is not None:
-            usages.append(usage)
-    return usages
+    for value in values:
+        if isinstance(value, dict):
+            usages.append(usage_from_json_value(value))
+    return filter_usages(usages, config)
 
 
-def print_mounts(usages: list[DiskUsage]) -> None:
-    if not usages:
-        print("No suitable local disks found.")
+def ssh_hosts_from_config(config: dict[str, Any]) -> list[str]:
+    ssh_config = config.get("ssh", {})
+    if not isinstance(ssh_config, dict) or not ssh_config.get("enabled"):
+        return []
+
+    hosts = ssh_config.get("hosts", [])
+    if not isinstance(hosts, list):
+        return []
+    return [str(host) for host in hosts if str(host).strip()]
+
+
+def collect_target_usages(config: dict[str, Any]) -> list[TargetDiskUsage]:
+    machine_name = str(config.get("machine_name") or socket.gethostname())
+    target_usages = [TargetDiskUsage(machine_name, usage) for usage in collect_usages(config)]
+    ssh_hosts = ssh_hosts_from_config(config)
+    if not ssh_hosts:
+        return target_usages
+
+    if shutil.which("ssh") is None:
+        print("Cannot collect SSH disk usages: ssh command not found.", file=sys.stderr)
+        return target_usages
+
+    try:
+        source = script_source_bytes()
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return target_usages
+
+    for host in ssh_hosts:
+        target_usages.extend(TargetDiskUsage(host, usage) for usage in collect_ssh_usages(host, config, source))
+    return target_usages
+
+
+def print_mounts(target_usages: list[TargetDiskUsage]) -> None:
+    if not target_usages:
+        print("No suitable disks found.")
         return
 
-    for usage in usages:
+    for target_usage in target_usages:
+        usage = target_usage.usage
         print(
-            f"{disk_label(usage.mount)}: "
+            f"{target_usage.machine_name}: {disk_label(usage.mount)}: "
             f"{format_number(usage.free_percent)}% free, "
             f"{format_number(usage.available_gb)} GB available"
         )
@@ -490,7 +784,6 @@ def is_within_notification_window(config: dict[str, Any]) -> bool:
 
 def run(config: dict[str, Any], *, test_mode: bool, dry_run: bool) -> int:
     threshold = float(config.get("threshold_free_percent", DEFAULT_THRESHOLD_FREE_PERCENT))
-    machine_name = str(config.get("machine_name") or socket.gethostname())
 
     if not test_mode and not is_within_notification_window(config):
         if dry_run:
@@ -501,15 +794,15 @@ def run(config: dict[str, Any], *, test_mode: bool, dry_run: bool) -> int:
             )
         return 0
 
-    usages = collect_usages(config)
+    target_usages = collect_target_usages(config)
 
     if test_mode:
-        messages = [format_message(usage, machine_name) for usage in usages]
+        messages = [format_message(target_usage.usage, target_usage.machine_name) for target_usage in target_usages]
     else:
         messages = [
-            format_message(usage, machine_name)
-            for usage in usages
-            if usage.free_percent < threshold
+            format_message(target_usage.usage, target_usage.machine_name)
+            for target_usage in target_usages
+            if target_usage.usage.free_percent < threshold
         ]
 
     if messages and not dry_run and not has_notification_channel(config):
@@ -593,6 +886,8 @@ def installer_default_values() -> dict[str, Any]:
         "notify_not_after": DEFAULT_NOTIFY_NOT_AFTER,
         "timer_interval_hours": str(DEFAULT_TIMER_INTERVAL_HOURS),
         "blacklist_mount_points": [],
+        "ssh_enabled": False,
+        "ssh_config_file": str(Path.home() / ".ssh/config"),
     }
 
 
@@ -613,6 +908,7 @@ def load_installer_defaults(config_path: str, label: str) -> tuple[dict[str, Any
         print(f"Could not load defaults from {label}; using installer defaults.", file=sys.stderr)
         return defaults, False
 
+    ssh_settings = normalize_ssh_settings(config.get("ssh"))
     defaults.update(
         {
             "ntfy_base_url": installer_url_default(config.get("ntfy_base_url"), strip_trailing_slash=True),
@@ -635,6 +931,8 @@ def load_installer_defaults(config_path: str, label: str) -> tuple[dict[str, Any
                 config.get("timer_interval_hours", DEFAULT_TIMER_INTERVAL_HOURS)
             ),
             "blacklist_mount_points": installer_blacklist_mount_points(config),
+            "ssh_enabled": bool(ssh_settings["enabled"]),
+            "ssh_config_file": string_config_value(ssh_settings["config_file"]),
         }
     )
     print(f"Loaded defaults from {label}.")
@@ -703,6 +1001,31 @@ def prompt_positive_integer(prompt: str, default: str) -> str:
         if re.fullmatch(r"[1-9][0-9]*", value):
             return value
         print("Please enter a positive integer.", file=sys.stderr)
+
+
+def prompt_yes_no(prompt: str, default: bool = False) -> bool:
+    suffix = "Y/n" if default else "y/N"
+    while True:
+        value = input(f"{prompt} [{suffix}]: ").strip().lower()
+        if not value:
+            return default
+        if value in {"y", "yes", "д", "да"}:
+            return True
+        if value in {"n", "no", "н", "нет"}:
+            return False
+        print("Please answer yes or no.", file=sys.stderr)
+
+
+def prompt_ssh_enabled(config_file: str, home_dir: str | None, default: bool) -> bool:
+    hosts = ssh_config_hosts(config_file, home_dir)
+    if not hosts:
+        print(f"No SSH hosts found in {config_file}.")
+        return False
+
+    print("SSH hosts from your config:")
+    for host in hosts:
+        print(f"- {host}")
+    return prompt_yes_no("Check disks on SSH hosts from your config?", default)
 
 
 def installer_disk_candidates(machine_name: str) -> list[dict[str, Any]]:
@@ -840,6 +1163,8 @@ def configure_install(args: argparse.Namespace) -> int:
     notify_not_before = prompt_time("Do not notify before local time", defaults["notify_not_before"])
     notify_not_after = prompt_time("Do not notify after local time", defaults["notify_not_after"])
     timer_interval_hours = prompt_positive_integer("Run check every N hours", defaults["timer_interval_hours"])
+    ssh_config_file = args.ssh_config or defaults["ssh_config_file"]
+    ssh_enabled = prompt_ssh_enabled(ssh_config_file, args.ssh_home, bool(defaults["ssh_enabled"]))
 
     print()
     blacklist_mount_points = select_installer_blacklist(
@@ -859,6 +1184,12 @@ def configure_install(args: argparse.Namespace) -> int:
         "notify_not_before": notify_not_before.strip(),
         "notify_not_after": notify_not_after.strip(),
         "timer_interval_hours": int(timer_interval_hours),
+        "ssh": {
+            "enabled": ssh_enabled,
+            "config_file": ssh_config_file,
+            "connect_timeout_seconds": DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS,
+            "command_timeout_seconds": DEFAULT_SSH_COMMAND_TIMEOUT_SECONDS,
+        },
         "blacklist": {
             "mount_points": blacklist_mount_points,
         },
@@ -876,10 +1207,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help=f"Config path, default: {DEFAULT_CONFIG_PATH}")
     parser.add_argument("--test", action="store_true", help="Send a message for every selected disk, ignoring threshold.")
     parser.add_argument("--dry-run", action="store_true", help="Print messages instead of sending notifications.")
-    parser.add_argument("--list-disks", action="store_true", help="Print selected local disks and exit.")
+    parser.add_argument("--list-disks", action="store_true", help="Print selected disks and exit.")
+    parser.add_argument("--probe-json", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--configure-install", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--existing-config", help=argparse.SUPPRESS)
     parser.add_argument("--existing-config-label", help=argparse.SUPPRESS)
+    parser.add_argument("--ssh-config", help=argparse.SUPPRESS)
+    parser.add_argument("--ssh-home", help=argparse.SUPPRESS)
     parser.add_argument("--output-config", help=argparse.SUPPRESS)
     parser.add_argument("--output-timer-interval", help=argparse.SUPPRESS)
     return parser.parse_args()
@@ -888,12 +1222,15 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
 
+    if args.probe_json:
+        return print_probe_json()
+
     if args.configure_install:
         return configure_install(args)
 
     if args.list_disks:
-        config = load_config(args.config) if Path(args.config).exists() else {}
-        print_mounts(collect_usages(config))
+        config = load_config(args.config) if Path(args.config).exists() else {"machine_name": socket.gethostname()}
+        print_mounts(collect_target_usages(config))
         return 0
 
     config = load_config(args.config)

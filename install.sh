@@ -30,9 +30,18 @@ UV_BIN="$(command -v uv)"
 
 if [[ "${EUID}" -eq 0 ]]; then
   SUDO=()
+  INSTALL_USER="${SUDO_USER:-$(id -un)}"
 else
   SUDO=(sudo)
+  INSTALL_USER="$(id -un)"
 fi
+INSTALL_GROUP="$(id -gn "${INSTALL_USER}")"
+INSTALL_HOME="$(getent passwd "${INSTALL_USER}" | cut -d: -f6)"
+if [[ -z "${INSTALL_HOME}" ]]; then
+  echo "Cannot determine home directory for ${INSTALL_USER}." >&2
+  exit 1
+fi
+SSH_CONFIG_FILE="${INSTALL_HOME}/.ssh/config"
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "${tmp_dir}"' EXIT
@@ -58,6 +67,8 @@ fi
   --configure-install \
   --existing-config "${existing_config_path}" \
   --existing-config-label "${CONFIG_FILE}" \
+  --ssh-config "${SSH_CONFIG_FILE}" \
+  --ssh-home "${INSTALL_HOME}" \
   --output-config "${tmp_config}" \
   --output-timer-interval "${tmp_timer_interval}"
 
@@ -77,6 +88,10 @@ After=network-online.target
 
 [Service]
 Type=oneshot
+User=${INSTALL_USER}
+Group=${INSTALL_GROUP}
+Environment=HOME=${INSTALL_HOME}
+WorkingDirectory=${INSTALL_HOME}
 ExecStart=${WRAPPER_BIN} --config ${CONFIG_FILE}
 SERVICE
 
@@ -97,7 +112,7 @@ TIMER
 
 "${SUDO[@]}" install -Dm755 "${SOURCE_SCRIPT}" "${APP_DIR}/free_space_alarmer_ntfy.py"
 "${SUDO[@]}" install -Dm755 "${tmp_wrapper}" "${WRAPPER_BIN}"
-"${SUDO[@]}" install -Dm600 "${tmp_config}" "${CONFIG_FILE}"
+"${SUDO[@]}" install -Dm600 -o "${INSTALL_USER}" -g "${INSTALL_GROUP}" "${tmp_config}" "${CONFIG_FILE}"
 "${SUDO[@]}" install -Dm644 "${tmp_service}" "${SERVICE_FILE}"
 "${SUDO[@]}" install -Dm644 "${tmp_timer}" "${TIMER_FILE}"
 
@@ -106,4 +121,4 @@ TIMER
 
 echo "Installed ${APP_NAME}."
 echo "Timer status: systemctl status ${APP_NAME}.timer"
-echo "Send test messages for selected disks after blacklist: sudo ${APP_NAME} --config ${CONFIG_FILE} --test"
+echo "Send test messages for selected disks after blacklist: ${APP_NAME} --config ${CONFIG_FILE} --test"
