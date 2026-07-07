@@ -43,6 +43,7 @@ fi
 DEFAULT_THRESHOLD_FREE_PERCENT="10"
 DEFAULT_NOTIFY_NOT_BEFORE="10:00"
 DEFAULT_NOTIFY_NOT_AFTER="20:00"
+DEFAULT_TIMER_INTERVAL_HOURS="1"
 
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "${tmp_dir}"' EXIT
@@ -65,14 +66,21 @@ load_existing_config_defaults() {
     reader=("${SUDO[@]}" "${PYTHON_CMD[@]}")
   fi
 
-  "${reader[@]}" - "${CONFIG_FILE}" "${tmp_existing_config}" "${DEFAULT_THRESHOLD_FREE_PERCENT}" "${DEFAULT_NOTIFY_NOT_BEFORE}" "${DEFAULT_NOTIFY_NOT_AFTER}" <<'PY'
+  "${reader[@]}" - "${CONFIG_FILE}" "${tmp_existing_config}" "${DEFAULT_THRESHOLD_FREE_PERCENT}" "${DEFAULT_NOTIFY_NOT_BEFORE}" "${DEFAULT_NOTIFY_NOT_AFTER}" "${DEFAULT_TIMER_INTERVAL_HOURS}" <<'PY'
 import json
 import math
 import re
 import sys
 from pathlib import Path
 
-config_path, defaults_path, default_threshold, default_not_before, default_not_after = sys.argv[1:]
+(
+    config_path,
+    defaults_path,
+    default_threshold,
+    default_not_before,
+    default_not_after,
+    default_timer_interval_hours,
+) = sys.argv[1:]
 config = json.loads(Path(config_path).read_text(encoding="utf-8"))
 
 
@@ -112,6 +120,13 @@ def normalize_time(value, fallback):
     return f"{int(match.group(1)):02d}:{int(match.group(2)):02d}"
 
 
+def normalize_timer_interval_hours(value):
+    text = str(value).strip()
+    if re.fullmatch(r"[1-9][0-9]*", text):
+        return text
+    return default_timer_interval_hours
+
+
 def blacklist_mount_points():
     blacklist = config.get("blacklist", {})
     if not isinstance(blacklist, dict):
@@ -147,6 +162,9 @@ defaults = {
     "notify_not_after": normalize_time(
         config.get("notify_not_after", default_not_after),
         default_not_after,
+    ),
+    "timer_interval_hours": normalize_timer_interval_hours(
+        config.get("timer_interval_hours", default_timer_interval_hours)
     ),
     "blacklist_mount_points": blacklist_mount_points(),
 }
@@ -294,6 +312,22 @@ PY
   done
 }
 
+prompt_positive_integer() {
+  local prompt="$1"
+  local default="$2"
+  local value=""
+
+  while true; do
+    read -r -p "${prompt} [${default}]: " value
+    value="${value:-${default}}"
+    if [[ "${value}" =~ ^[1-9][0-9]*$ ]]; then
+      printf '%s' "${value}"
+      return
+    fi
+    echo "Please enter a positive integer." >&2
+  done
+}
+
 echo "Notification channels are optional. Enter '-' instead of the URL to disable ntfy or Mattermost."
 echo "ntfy base URL example: https://ntfy-base-server.ru"
 default_ntfy_base_url="$(existing_default "ntfy_base_url")"
@@ -341,10 +375,12 @@ fi
 default_threshold_free_percent="$(existing_default "threshold_free_percent")"
 default_notify_not_before="$(existing_default "notify_not_before")"
 default_notify_not_after="$(existing_default "notify_not_after")"
+default_timer_interval_hours="$(existing_default "timer_interval_hours")"
 
 threshold_free_percent="$(prompt_threshold "Alert when free space is below percent" "${default_threshold_free_percent:-${DEFAULT_THRESHOLD_FREE_PERCENT}}")"
 notify_not_before="$(prompt_time "Do not notify before local time" "${default_notify_not_before:-${DEFAULT_NOTIFY_NOT_BEFORE}}")"
 notify_not_after="$(prompt_time "Do not notify after local time" "${default_notify_not_after:-${DEFAULT_NOTIFY_NOT_AFTER}}")"
+timer_interval_hours="$(prompt_positive_integer "Run check every N hours" "${default_timer_interval_hours:-${DEFAULT_TIMER_INTERVAL_HOURS}}")"
 
 "${PYTHON_CMD[@]}" - "${SOURCE_SCRIPT}" "${tmp_candidates}" "${machine_name}" <<'PY'
 import importlib.util
@@ -499,7 +535,7 @@ else:
 PY
 fi
 
-"${PYTHON_CMD[@]}" - "${tmp_config}" "${ntfy_base_url}" "${ntfy_topic}" "${ntfy_bearer_token}" "${mattermost_webhook_url}" "${machine_name}" "${threshold_free_percent}" "${notify_not_before}" "${notify_not_after}" "${tmp_blacklist}" <<'PY'
+"${PYTHON_CMD[@]}" - "${tmp_config}" "${ntfy_base_url}" "${ntfy_topic}" "${ntfy_bearer_token}" "${mattermost_webhook_url}" "${machine_name}" "${threshold_free_percent}" "${notify_not_before}" "${notify_not_after}" "${timer_interval_hours}" "${tmp_blacklist}" <<'PY'
 import json
 from pathlib import Path
 import sys
@@ -514,6 +550,7 @@ import sys
     threshold_free_percent,
     notify_not_before,
     notify_not_after,
+    timer_interval_hours,
     blacklist_path,
 ) = sys.argv[1:]
 token = ntfy_bearer_token.strip()
@@ -526,6 +563,7 @@ config = {
     "threshold_free_percent": float(threshold_free_percent),
     "notify_not_before": notify_not_before.strip(),
     "notify_not_after": notify_not_after.strip(),
+    "timer_interval_hours": int(timer_interval_hours),
     "blacklist": {
         "mount_points": json.loads(Path(blacklist_path).read_text(encoding="utf-8")),
     },
@@ -556,11 +594,11 @@ SERVICE
 
 cat >"${tmp_timer}" <<TIMER
 [Unit]
-Description=Run free-space alarm every hour
+Description=Run free-space alarm every ${timer_interval_hours}h
 
 [Timer]
 OnBootSec=5min
-OnUnitActiveSec=1h
+OnUnitActiveSec=${timer_interval_hours}h
 AccuracySec=5min
 Persistent=true
 Unit=${APP_NAME}.service
