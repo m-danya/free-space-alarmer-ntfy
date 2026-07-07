@@ -28,11 +28,21 @@ fi
 
 UV_BIN="$(command -v uv)"
 
+if command -v python3 >/dev/null 2>&1; then
+  PYTHON_CMD=(python3)
+else
+  PYTHON_CMD=("${UV_BIN}" run python)
+fi
+
 if [[ "${EUID}" -eq 0 ]]; then
   SUDO=()
 else
   SUDO=(sudo)
 fi
+
+DEFAULT_THRESHOLD_FREE_PERCENT="10"
+DEFAULT_NOTIFY_NOT_BEFORE="10:00"
+DEFAULT_NOTIFY_NOT_AFTER="20:00"
 
 prompt_required() {
   local prompt="$1"
@@ -41,6 +51,54 @@ prompt_required() {
     read -r -p "${prompt}: " value
   done
   printf '%s' "${value}"
+}
+
+prompt_time() {
+  local prompt="$1"
+  local default="$2"
+  local value=""
+  local hours=""
+  local minutes=""
+
+  while true; do
+    read -r -p "${prompt} [${default}]: " value
+    value="${value:-${default}}"
+    if [[ "${value}" =~ ^([01]?[0-9]|2[0-3]):([0-5][0-9])$ ]]; then
+      hours="${BASH_REMATCH[1]}"
+      minutes="${BASH_REMATCH[2]}"
+      printf '%02d:%02d' "$((10#${hours}))" "$((10#${minutes}))"
+      return
+    fi
+    echo "Please enter time as HH:MM, from 00:00 to 23:59." >&2
+  done
+}
+
+prompt_threshold() {
+  local prompt="$1"
+  local default="$2"
+  local value=""
+
+  while true; do
+    read -r -p "${prompt} [${default}]: " value
+    value="${value:-${default}}"
+    if "${PYTHON_CMD[@]}" - "${value}" <<'PY'
+import math
+import sys
+
+try:
+    value = float(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+
+if not math.isfinite(value) or value < 0 or value > 100:
+    raise SystemExit(1)
+PY
+    then
+      printf '%s' "${value}"
+      return
+    fi
+    echo "Please enter a number from 0 to 100." >&2
+  done
 }
 
 echo "ntfy base URL example: https://ntfy-base-server.ru"
@@ -64,6 +122,10 @@ default_machine_name="$(hostname -f 2>/dev/null || hostname)"
 read -r -p "Machine name [${default_machine_name}]: " machine_name
 machine_name="${machine_name:-${default_machine_name}}"
 
+threshold_free_percent="$(prompt_threshold "Alert when free space is below percent" "${DEFAULT_THRESHOLD_FREE_PERCENT}")"
+notify_not_before="$(prompt_time "Do not notify before local time" "${DEFAULT_NOTIFY_NOT_BEFORE}")"
+notify_not_after="$(prompt_time "Do not notify after local time" "${DEFAULT_NOTIFY_NOT_AFTER}")"
+
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "${tmp_dir}"' EXIT
 
@@ -73,12 +135,6 @@ tmp_blacklist="${tmp_dir}/blacklist.json"
 tmp_wrapper="${tmp_dir}/${APP_NAME}"
 tmp_service="${tmp_dir}/${APP_NAME}.service"
 tmp_timer="${tmp_dir}/${APP_NAME}.timer"
-
-if command -v python3 >/dev/null 2>&1; then
-  PYTHON_CMD=(python3)
-else
-  PYTHON_CMD=("${UV_BIN}" run python)
-fi
 
 "${PYTHON_CMD[@]}" - "${SOURCE_SCRIPT}" "${tmp_candidates}" "${machine_name}" <<'PY'
 import importlib.util
@@ -186,19 +242,31 @@ else:
 PY
 fi
 
-"${PYTHON_CMD[@]}" - "${tmp_config}" "${ntfy_base_url}" "${ntfy_topic}" "${ntfy_bearer_token}" "${machine_name}" "${tmp_blacklist}" <<'PY'
+"${PYTHON_CMD[@]}" - "${tmp_config}" "${ntfy_base_url}" "${ntfy_topic}" "${ntfy_bearer_token}" "${machine_name}" "${threshold_free_percent}" "${notify_not_before}" "${notify_not_after}" "${tmp_blacklist}" <<'PY'
 import json
 from pathlib import Path
 import sys
 
-config_path, ntfy_base_url, ntfy_topic, ntfy_bearer_token, machine_name, blacklist_path = sys.argv[1:]
+(
+    config_path,
+    ntfy_base_url,
+    ntfy_topic,
+    ntfy_bearer_token,
+    machine_name,
+    threshold_free_percent,
+    notify_not_before,
+    notify_not_after,
+    blacklist_path,
+) = sys.argv[1:]
 token = ntfy_bearer_token.strip()
 config = {
     "ntfy_base_url": ntfy_base_url.strip(),
     "ntfy_topic": ntfy_topic.strip(),
     "ntfy_bearer_token": token or None,
     "machine_name": machine_name.strip(),
-    "threshold_free_percent": 10.0,
+    "threshold_free_percent": float(threshold_free_percent),
+    "notify_not_before": notify_not_before.strip(),
+    "notify_not_after": notify_not_after.strip(),
     "blacklist": {
         "mount_points": json.loads(Path(blacklist_path).read_text(encoding="utf-8")),
     },

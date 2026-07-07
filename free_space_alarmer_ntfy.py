@@ -16,13 +16,17 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 
 DEFAULT_CONFIG_PATH = "/etc/free-space-alarmer-ntfy/config.json"
 DEFAULT_THRESHOLD_FREE_PERCENT = 10.0
+DEFAULT_NOTIFY_NOT_BEFORE = "10:00"
+DEFAULT_NOTIFY_NOT_AFTER = "20:00"
 GIB = 1024**3
+TIME_VALUE_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
 PSEUDO_FS_TYPES = {
     "autofs",
@@ -268,9 +272,43 @@ def load_config(path: str) -> dict[str, Any]:
         raise SystemExit(f"Missing required config fields: {', '.join(missing_fields)}")
 
     config.setdefault("machine_name", socket.gethostname())
-    config.setdefault("threshold_free_percent", DEFAULT_THRESHOLD_FREE_PERCENT)
+    config["threshold_free_percent"] = parse_threshold_free_percent(
+        config.get("threshold_free_percent", DEFAULT_THRESHOLD_FREE_PERCENT)
+    )
+    config["notify_not_before"] = normalize_time_value(
+        config.get("notify_not_before", DEFAULT_NOTIFY_NOT_BEFORE),
+        "notify_not_before",
+    )
+    config["notify_not_after"] = normalize_time_value(
+        config.get("notify_not_after", DEFAULT_NOTIFY_NOT_AFTER),
+        "notify_not_after",
+    )
     config.setdefault("blacklist", {"mount_points": []})
     return config
+
+
+def parse_threshold_free_percent(value: Any) -> float:
+    try:
+        threshold = float(value)
+    except (TypeError, ValueError):
+        raise SystemExit("Invalid config: threshold_free_percent must be a number") from None
+
+    if not math.isfinite(threshold) or threshold < 0 or threshold > 100:
+        raise SystemExit("Invalid config: threshold_free_percent must be between 0 and 100")
+    return threshold
+
+
+def parse_time_value(value: Any, field_name: str) -> int:
+    text = str(value).strip()
+    match = TIME_VALUE_RE.fullmatch(text)
+    if not match:
+        raise SystemExit(f"Invalid config: {field_name} must be time in HH:MM format")
+    return (int(match.group(1)) * 60) + int(match.group(2))
+
+
+def normalize_time_value(value: Any, field_name: str) -> str:
+    minutes = parse_time_value(value, field_name)
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
 
 
 def blacklisted_mount_points(config: dict[str, Any] | None) -> set[str]:
@@ -362,9 +400,30 @@ def print_mounts(usages: list[DiskUsage]) -> None:
         )
 
 
+def is_within_notification_window(config: dict[str, Any]) -> bool:
+    not_before = parse_time_value(config.get("notify_not_before", DEFAULT_NOTIFY_NOT_BEFORE), "notify_not_before")
+    not_after = parse_time_value(config.get("notify_not_after", DEFAULT_NOTIFY_NOT_AFTER), "notify_not_after")
+    now = datetime.now()
+    current_minutes = (now.hour * 60) + now.minute
+
+    if not_before <= not_after:
+        return not_before <= current_minutes <= not_after
+    return current_minutes >= not_before or current_minutes <= not_after
+
+
 def run(config: dict[str, Any], *, test_mode: bool, dry_run: bool) -> int:
     threshold = float(config.get("threshold_free_percent", DEFAULT_THRESHOLD_FREE_PERCENT))
     machine_name = str(config.get("machine_name") or socket.gethostname())
+
+    if not test_mode and not is_within_notification_window(config):
+        if dry_run:
+            print(
+                "Outside notification window "
+                f"{config.get('notify_not_before', DEFAULT_NOTIFY_NOT_BEFORE)}-"
+                f"{config.get('notify_not_after', DEFAULT_NOTIFY_NOT_AFTER)}; no alerts to send."
+            )
+        return 0
+
     usages = collect_usages(config)
 
     if test_mode:
