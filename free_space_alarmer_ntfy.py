@@ -572,7 +572,7 @@ def disk_label(mount: MountEntry) -> str:
 
 def format_message(usage: DiskUsage, machine_name: str) -> str:
     return (
-        f"🚨 На диске {disk_label(usage.mount)} на машине {machine_name} осталось "
+        f"🚨 На диске {disk_label(usage.mount)} на машине **{machine_name}** осталось "
         f"{format_number(usage.free_percent)}% свободного места "
         f"({format_number(usage.available_gb)} GB)"
     )
