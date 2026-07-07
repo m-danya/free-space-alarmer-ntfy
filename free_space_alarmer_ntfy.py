@@ -1028,19 +1028,47 @@ def prompt_ssh_enabled(config_file: str, home_dir: str | None, default: bool) ->
     return prompt_yes_no("Check disks on SSH hosts from your config?", default)
 
 
-def installer_disk_candidates(machine_name: str) -> list[dict[str, Any]]:
+def is_default_blacklist_mount_point(mount_point: str) -> bool:
+    return (
+        mount_point == "/boot"
+        or mount_point.startswith("/boot/")
+        or mount_point == "/dump"
+        or mount_point.startswith("/dump/")
+    )
+
+
+def installer_disk_candidates(target_usages: list[TargetDiskUsage]) -> list[dict[str, Any]]:
     candidates = []
-    for index, usage in enumerate(collect_usages(), start=1):
+    for index, target_usage in enumerate(target_usages, start=1):
+        usage = target_usage.usage
         mount_point = usage.mount.mount_point
         candidates.append(
             {
                 "number": index,
                 "mount_point": mount_point,
-                "message": format_message(usage, machine_name),
-                "default_blacklist": "/boot" in mount_point,
+                "message": format_message(usage, target_usage.machine_name),
+                "default_blacklist": is_default_blacklist_mount_point(mount_point),
             }
         )
     return candidates
+
+
+def installer_target_usages(machine_name: str, ssh_enabled: bool, ssh_config_file: str) -> list[TargetDiskUsage]:
+    config = {
+        "machine_name": machine_name,
+        "ssh": normalize_ssh_settings(
+            {
+                "enabled": ssh_enabled,
+                "config_file": ssh_config_file,
+                "connect_timeout_seconds": DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS,
+                "command_timeout_seconds": DEFAULT_SSH_COMMAND_TIMEOUT_SECONDS,
+            }
+        ),
+        "blacklist": {
+            "mount_points": [],
+        },
+    }
+    return collect_target_usages(config)
 
 
 def append_unique_mount_point(mount_points: list[str], mount_point: str) -> None:
@@ -1054,7 +1082,7 @@ def select_installer_blacklist(
     existing_config_present: bool,
 ) -> list[str]:
     if not candidates:
-        print("No suitable local disks found for test messages.")
+        print("No suitable disks found for test messages.")
         if existing_config_present:
             return list(defaults["blacklist_mount_points"])
         return []
@@ -1167,8 +1195,10 @@ def configure_install(args: argparse.Namespace) -> int:
     ssh_enabled = prompt_ssh_enabled(ssh_config_file, args.ssh_home, bool(defaults["ssh_enabled"]))
 
     print()
+    if ssh_enabled:
+        print("Collecting disk list from local and SSH hosts...")
     blacklist_mount_points = select_installer_blacklist(
-        installer_disk_candidates(machine_name),
+        installer_disk_candidates(installer_target_usages(machine_name, ssh_enabled, ssh_config_file)),
         defaults,
         existing_config_present,
     )
