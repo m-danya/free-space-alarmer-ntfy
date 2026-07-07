@@ -282,11 +282,18 @@ echo 'Optional bearer token. Example: curl -H "Authorization: Bearer 78c5506d074
 default_ntfy_bearer_token="$(existing_default "ntfy_bearer_token")"
 ntfy_bearer_token="$(prompt_optional_secret "ntfy bearer token" "${default_ntfy_bearer_token}")"
 
-host_machine_name="$(hostname -f 2>/dev/null || hostname)"
+host_machine_name=""
+if command -v hostname >/dev/null 2>&1; then
+  host_machine_name="$(hostname -f 2>/dev/null || hostname 2>/dev/null || true)"
+fi
 default_machine_name="$(existing_default "machine_name")"
 default_machine_name="${default_machine_name:-${host_machine_name}}"
-read -r -p "Machine name [${default_machine_name}]: " machine_name
-machine_name="${machine_name:-${default_machine_name}}"
+if [[ -n "${default_machine_name}" ]]; then
+  read -r -p "Machine name [${default_machine_name}]: " machine_name
+  machine_name="${machine_name:-${default_machine_name}}"
+else
+  read -r -p "Machine name: " machine_name
+fi
 
 default_threshold_free_percent="$(existing_default "threshold_free_percent")"
 default_notify_not_before="$(existing_default "notify_not_before")"
