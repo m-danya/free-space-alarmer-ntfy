@@ -46,6 +46,7 @@ chmod +x install.sh uninstall.sh free_space_alarmer_ntfy.py
 - период повторного алерта по той же проблеме в часах, по умолчанию `24`
 - `Check disks on SSH hosts from your config?`; перед вопросом инсталлер перечислит конкретные `Host`-алиасы из `~/.ssh/config`
 - `Alert if an SSH host is unavailable?`, если SSH-обход включен; по умолчанию `N`
+- номера SSH-машин для blacklist, если SSH-обход включен; перед этим инсталлер проверит доступность SSH-машин, а недоступные выберет по умолчанию
 - номера дисков для blacklist; перед этим инсталлер покажет test-сообщения по всем найденным дискам
 
 Для ntfy и Mattermost можно ввести `-` вместо URL, чтобы отключить канал. У ntfy дефолт берется из существующего конфига, если он есть. У Mattermost по умолчанию выбран `-`, то есть канал отключен.
@@ -63,7 +64,7 @@ chmod +x install.sh uninstall.sh free_space_alarmer_ntfy.py
 
 Таймер запускает проверку с настроенной периодичностью. Скрипт сам пропускает обычные уведомления вне настроенного временного окна.
 
-На шаге blacklist можно указать номера через пробел. Если просто нажать Enter, по умолчанию будут исключены mount points `/boot`, `/boot/...`, `/dump` и `/dump/...`.
+На шагах blacklist можно указать номера через пробел. Для SSH-машин Enter по умолчанию исключит все машины, которые сейчас недоступны. Для дисков Enter по умолчанию исключит mount points `/boot`, `/boot/...`, `/dump` и `/dump/...`.
 
 Настройки хранятся в `/etc/free-space-alarmer-ntfy/config.json`:
 
@@ -87,7 +88,8 @@ chmod +x install.sh uninstall.sh free_space_alarmer_ntfy.py
     "command_timeout_seconds": 60
   },
   "blacklist": {
-    "mount_points": ["/boot", "/boot/efi"]
+    "mount_points": ["/boot", "/boot/efi"],
+    "ssh_hosts": ["old-host"]
   }
 }
 ```
@@ -100,7 +102,7 @@ chmod +x install.sh uninstall.sh free_space_alarmer_ntfy.py
 
 ## Тестовое сообщение
 
-Команда отправит проверочное сообщение по всем подходящим дискам на этой машине и на включенных SSH-машинах с текущим уровнем свободного места. Blacklist из конфига учитывается, порог и временное окно игнорируются:
+Команда отправит проверочное сообщение по всем подходящим дискам на этой машине и на включенных SSH-машинах с текущим уровнем свободного места. Blacklist дисков и SSH-машин из конфига учитывается, порог и временное окно игнорируются:
 
 ```bash
 free-space-alarmer-ntfy --config /etc/free-space-alarmer-ntfy/config.json --test

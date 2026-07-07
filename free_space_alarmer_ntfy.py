@@ -165,6 +165,7 @@ class DiskUsage:
 class TargetDiskUsage:
     machine_name: str
     usage: DiskUsage
+    is_remote: bool = False
 
 
 @dataclass(frozen=True)
@@ -605,6 +606,22 @@ def blacklisted_mount_points(config: dict[str, Any] | None) -> set[str]:
     return {str(value) for value in values if str(value).strip()}
 
 
+def blacklisted_ssh_hosts(config: dict[str, Any] | None) -> set[str]:
+    if not config:
+        return set()
+
+    blacklist = config.get("blacklist", {})
+    if isinstance(blacklist, dict):
+        values = blacklist.get("ssh_hosts", [])
+    else:
+        values = []
+
+    if not isinstance(values, list):
+        raise SystemExit("Invalid config: blacklist.ssh_hosts must be a list")
+
+    return {str(value).strip() for value in values if str(value).strip()}
+
+
 def is_blacklisted(mount: MountEntry, config: dict[str, Any] | None) -> bool:
     return mount.mount_point in blacklisted_mount_points(config)
 
@@ -789,7 +806,8 @@ def ssh_hosts_from_config(config: dict[str, Any]) -> list[str]:
     hosts = ssh_config.get("hosts", [])
     if not isinstance(hosts, list):
         return []
-    return [str(host) for host in hosts if str(host).strip()]
+    blocked_hosts = blacklisted_ssh_hosts(config)
+    return [str(host).strip() for host in hosts if str(host).strip() and str(host).strip() not in blocked_hosts]
 
 
 def collect_target_collection(config: dict[str, Any]) -> TargetCollection:
@@ -819,7 +837,7 @@ def collect_target_collection(config: dict[str, Any]) -> TargetCollection:
             unavailable_hosts.append(probe_result.unavailable_host)
             continue
         reachable_ssh_hosts.append(host)
-        target_usages.extend(TargetDiskUsage(host, usage) for usage in probe_result.usages)
+        target_usages.extend(TargetDiskUsage(host, usage, True) for usage in probe_result.usages)
     return TargetCollection(target_usages, unavailable_hosts, reachable_ssh_hosts)
 
 
@@ -1125,6 +1143,23 @@ def installer_blacklist_mount_points(config: dict[str, Any]) -> list[str]:
     return mount_points
 
 
+def installer_blacklist_ssh_hosts(config: dict[str, Any]) -> list[str]:
+    blacklist = config.get("blacklist", {})
+    if not isinstance(blacklist, dict):
+        return []
+
+    values = blacklist.get("ssh_hosts", [])
+    if not isinstance(values, list):
+        return []
+
+    hosts: list[str] = []
+    for value in values:
+        host = string_config_value(value)
+        if host and host not in hosts:
+            hosts.append(host)
+    return hosts
+
+
 def installer_default_values() -> dict[str, Any]:
     return {
         "ntfy_base_url": "",
@@ -1139,6 +1174,7 @@ def installer_default_values() -> dict[str, Any]:
         "repeat_alert_interval_hours": str(DEFAULT_REPEAT_ALERT_INTERVAL_HOURS),
         "alert_state_path": DEFAULT_ALERT_STATE_PATH,
         "blacklist_mount_points": [],
+        "blacklist_ssh_hosts": [],
         "ssh_enabled": False,
         "ssh_alert_unavailable": False,
         "ssh_config_file": str(Path.home() / ".ssh/config"),
@@ -1189,6 +1225,7 @@ def load_installer_defaults(config_path: str, label: str) -> tuple[dict[str, Any
             ),
             "alert_state_path": string_config_value(config.get("alert_state_path")) or DEFAULT_ALERT_STATE_PATH,
             "blacklist_mount_points": installer_blacklist_mount_points(config),
+            "blacklist_ssh_hosts": installer_blacklist_ssh_hosts(config),
             "ssh_enabled": bool(ssh_settings["enabled"]),
             "ssh_alert_unavailable": bool(ssh_settings["alert_unavailable"]),
             "ssh_config_file": string_config_value(ssh_settings["config_file"]),
@@ -1312,27 +1349,160 @@ def installer_disk_candidates(target_usages: list[TargetDiskUsage]) -> list[dict
     return candidates
 
 
-def installer_target_usages(machine_name: str, ssh_enabled: bool, ssh_config_file: str) -> list[TargetDiskUsage]:
+def installer_target_collection(
+    machine_name: str,
+    ssh_enabled: bool,
+    ssh_config_file: str,
+    ssh_home: str | None = None,
+    blacklist_ssh_hosts: list[str] | None = None,
+) -> TargetCollection:
+    ssh_settings = normalize_ssh_settings(
+        {
+            "enabled": ssh_enabled,
+            "config_file": ssh_config_file,
+            "connect_timeout_seconds": DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS,
+            "command_timeout_seconds": DEFAULT_SSH_COMMAND_TIMEOUT_SECONDS,
+        }
+    )
+    ssh_settings["hosts"] = ssh_config_hosts(ssh_config_file, ssh_home) if ssh_enabled else []
+
     config = {
         "machine_name": machine_name,
-        "ssh": normalize_ssh_settings(
-            {
-                "enabled": ssh_enabled,
-                "config_file": ssh_config_file,
-                "connect_timeout_seconds": DEFAULT_SSH_CONNECT_TIMEOUT_SECONDS,
-                "command_timeout_seconds": DEFAULT_SSH_COMMAND_TIMEOUT_SECONDS,
-            }
-        ),
+        "ssh": ssh_settings,
         "blacklist": {
             "mount_points": [],
+            "ssh_hosts": blacklist_ssh_hosts or [],
         },
     }
-    return collect_target_usages(config)
+    return collect_target_collection(config)
+
+
+def installer_target_usages(machine_name: str, ssh_enabled: bool, ssh_config_file: str) -> list[TargetDiskUsage]:
+    return installer_target_collection(machine_name, ssh_enabled, ssh_config_file).usages
 
 
 def append_unique_mount_point(mount_points: list[str], mount_point: str) -> None:
     if mount_point and mount_point not in mount_points:
         mount_points.append(mount_point)
+
+
+def append_unique_ssh_host(hosts: list[str], host: str) -> None:
+    if host and host not in hosts:
+        hosts.append(host)
+
+
+def installer_ssh_blacklist_candidates(hosts: list[str], collection: TargetCollection) -> list[dict[str, Any]]:
+    unavailable_by_host = {unavailable.host: unavailable.reason for unavailable in collection.unavailable_hosts}
+    reachable_hosts = set(collection.reachable_ssh_hosts)
+    candidates = []
+    for index, host in enumerate(hosts, start=1):
+        reason = unavailable_by_host.get(host, "")
+        if reason:
+            status = f"unavailable: {reason}"
+            default_blacklist = True
+        elif host in reachable_hosts:
+            status = "reachable"
+            default_blacklist = False
+        else:
+            status = "not checked"
+            default_blacklist = False
+        candidates.append(
+            {
+                "number": index,
+                "host": host,
+                "status": status,
+                "default_blacklist": default_blacklist,
+            }
+        )
+    return candidates
+
+
+def filter_target_collection_for_ssh_blacklist(
+    collection: TargetCollection,
+    blacklist_ssh_hosts: list[str],
+) -> TargetCollection:
+    blacklisted = set(blacklist_ssh_hosts)
+    if not blacklisted:
+        return collection
+
+    return TargetCollection(
+        [
+            target_usage
+            for target_usage in collection.usages
+            if not (target_usage.is_remote and target_usage.machine_name in blacklisted)
+        ],
+        [unavailable for unavailable in collection.unavailable_hosts if unavailable.host not in blacklisted],
+        [host for host in collection.reachable_ssh_hosts if host not in blacklisted],
+    )
+
+
+def select_installer_ssh_blacklist(
+    candidates: list[dict[str, Any]],
+    defaults: dict[str, Any],
+    existing_config_present: bool,
+) -> list[str]:
+    if not candidates:
+        print("No SSH hosts found for blacklist.")
+        if existing_config_present:
+            return list(defaults["blacklist_ssh_hosts"])
+        return []
+
+    print("SSH hosts before blacklist:")
+    for candidate in candidates:
+        print(f"{candidate['number']}. {candidate['host']}: {candidate['status']}")
+
+    if existing_config_present:
+        existing_hosts = defaults["blacklist_ssh_hosts"]
+        default_numbers = [
+            str(candidate["number"])
+            for candidate in candidates
+            if candidate["host"] in existing_hosts or candidate["default_blacklist"]
+        ]
+        if default_numbers:
+            default_label = " ".join(default_numbers)
+        elif existing_hosts:
+            default_label = "keep existing"
+        else:
+            default_label = "empty"
+    else:
+        existing_hosts = []
+        default_numbers = [
+            str(candidate["number"])
+            for candidate in candidates
+            if candidate["default_blacklist"]
+        ]
+        default_label = " ".join(default_numbers) if default_numbers else "empty"
+
+    candidates_by_number = {candidate["number"]: candidate for candidate in candidates}
+    while True:
+        raw_numbers = input(f"SSH host blacklist numbers [{default_label}]: ")
+        defaulted = not raw_numbers
+        if defaulted:
+            raw_numbers = " ".join(default_numbers)
+
+        hosts: list[str] = []
+        if defaulted:
+            for host in existing_hosts:
+                append_unique_ssh_host(hosts, host)
+
+        try:
+            for raw_number in raw_numbers.split():
+                if not raw_number.isdigit():
+                    raise ValueError(f"Invalid SSH host blacklist number: {raw_number}")
+                number = int(raw_number)
+                candidate = candidates_by_number.get(number)
+                if candidate is None:
+                    raise ValueError(f"SSH host blacklist number out of range: {number}")
+                append_unique_ssh_host(hosts, str(candidate["host"]))
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            continue
+
+        if hosts:
+            print("Blacklisted SSH hosts: " + ", ".join(hosts))
+        else:
+            print("Blacklisted SSH hosts: none")
+        return hosts
 
 
 def select_installer_blacklist(
@@ -1464,10 +1634,23 @@ def configure_install(args: argparse.Namespace) -> int:
         )
 
     print()
+    blacklist_ssh_hosts = list(defaults["blacklist_ssh_hosts"]) if existing_config_present else []
     if ssh_enabled:
         print("Collecting disk list from local and SSH hosts...")
+    target_collection = installer_target_collection(machine_name, ssh_enabled, ssh_config_file, args.ssh_home)
+    if ssh_enabled:
+        blacklist_ssh_hosts = select_installer_ssh_blacklist(
+            installer_ssh_blacklist_candidates(
+                ssh_config_hosts(ssh_config_file, args.ssh_home),
+                target_collection,
+            ),
+            defaults,
+            existing_config_present,
+        )
+        target_collection = filter_target_collection_for_ssh_blacklist(target_collection, blacklist_ssh_hosts)
+
     blacklist_mount_points = select_installer_blacklist(
-        installer_disk_candidates(installer_target_usages(machine_name, ssh_enabled, ssh_config_file)),
+        installer_disk_candidates(target_collection.usages),
         defaults,
         existing_config_present,
     )
@@ -1494,6 +1677,7 @@ def configure_install(args: argparse.Namespace) -> int:
         },
         "blacklist": {
             "mount_points": blacklist_mount_points,
+            "ssh_hosts": blacklist_ssh_hosts,
         },
     }
 
