@@ -36,6 +36,7 @@ chmod +x install.sh uninstall.sh free_space_alarmer_ntfy.py
 - ntfy topic
 - bearer token, опционально
 - название машины, по умолчанию берется из `hostname`
+- номера дисков для blacklist; перед этим инсталлер покажет test-сообщения по всем найденным дискам
 
 После установки создаются:
 
@@ -47,9 +48,21 @@ chmod +x install.sh uninstall.sh free_space_alarmer_ntfy.py
 
 Таймер запускает проверку раз в час.
 
+На шаге blacklist можно указать номера через пробел. Если просто нажать Enter, по умолчанию будут исключены mount points, где есть `/boot`.
+
+Исключения хранятся в `/etc/free-space-alarmer-ntfy/config.json`:
+
+```json
+{
+  "blacklist": {
+    "mount_points": ["/boot", "/boot/efi"]
+  }
+}
+```
+
 ## Тестовое сообщение
 
-Команда отправит проверочное сообщение по всем подходящим дискам на этой машине с текущим уровнем свободного места:
+Команда отправит проверочное сообщение по всем подходящим дискам на этой машине с текущим уровнем свободного места. Blacklist из конфига учитывается:
 
 ```bash
 sudo free-space-alarmer-ntfy --config /etc/free-space-alarmer-ntfy/config.json --test

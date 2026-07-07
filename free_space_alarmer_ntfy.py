@@ -269,7 +269,28 @@ def load_config(path: str) -> dict[str, Any]:
 
     config.setdefault("machine_name", socket.gethostname())
     config.setdefault("threshold_free_percent", DEFAULT_THRESHOLD_FREE_PERCENT)
+    config.setdefault("blacklist", {"mount_points": []})
     return config
+
+
+def blacklisted_mount_points(config: dict[str, Any] | None) -> set[str]:
+    if not config:
+        return set()
+
+    blacklist = config.get("blacklist", {})
+    if isinstance(blacklist, dict):
+        values = blacklist.get("mount_points", [])
+    else:
+        values = []
+
+    if not isinstance(values, list):
+        raise SystemExit("Invalid config: blacklist.mount_points must be a list")
+
+    return {str(value) for value in values if str(value).strip()}
+
+
+def is_blacklisted(mount: MountEntry, config: dict[str, Any] | None) -> bool:
+    return mount.mount_point in blacklisted_mount_points(config)
 
 
 def format_number(value: float, digits: int = 1) -> str:
@@ -317,9 +338,11 @@ def send_ntfy_message(message: str, config: dict[str, Any]) -> None:
         raise RuntimeError(f"Cannot reach ntfy server: {exc.reason}") from exc
 
 
-def collect_usages() -> list[DiskUsage]:
+def collect_usages(config: dict[str, Any] | None = None) -> list[DiskUsage]:
     usages: list[DiskUsage] = []
     for mount in selected_mounts():
+        if is_blacklisted(mount, config):
+            continue
         usage = get_disk_usage(mount)
         if usage is not None:
             usages.append(usage)
@@ -342,7 +365,7 @@ def print_mounts(usages: list[DiskUsage]) -> None:
 def run(config: dict[str, Any], *, test_mode: bool, dry_run: bool) -> int:
     threshold = float(config.get("threshold_free_percent", DEFAULT_THRESHOLD_FREE_PERCENT))
     machine_name = str(config.get("machine_name") or socket.gethostname())
-    usages = collect_usages()
+    usages = collect_usages(config)
 
     if test_mode:
         messages = [format_message(usage, machine_name) for usage in usages]
@@ -379,8 +402,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+
     if args.list_disks:
-        print_mounts(collect_usages())
+        config = load_config(args.config) if Path(args.config).exists() else {}
+        print_mounts(collect_usages(config))
         return 0
 
     config = load_config(args.config)
