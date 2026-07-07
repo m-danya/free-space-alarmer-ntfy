@@ -44,13 +44,174 @@ DEFAULT_THRESHOLD_FREE_PERCENT="10"
 DEFAULT_NOTIFY_NOT_BEFORE="10:00"
 DEFAULT_NOTIFY_NOT_AFTER="20:00"
 
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf "${tmp_dir}"' EXIT
+
+tmp_config="${tmp_dir}/config.json"
+tmp_candidates="${tmp_dir}/candidates.json"
+tmp_blacklist="${tmp_dir}/blacklist.json"
+tmp_existing_config="${tmp_dir}/existing-config.json"
+tmp_wrapper="${tmp_dir}/${APP_NAME}"
+tmp_service="${tmp_dir}/${APP_NAME}.service"
+tmp_timer="${tmp_dir}/${APP_NAME}.timer"
+
+printf '{}\n' >"${tmp_existing_config}"
+existing_config_present=0
+
+load_existing_config_defaults() {
+  local reader=("${PYTHON_CMD[@]}")
+
+  if [[ ! -r "${CONFIG_FILE}" && "${#SUDO[@]}" -gt 0 ]]; then
+    reader=("${SUDO[@]}" "${PYTHON_CMD[@]}")
+  fi
+
+  "${reader[@]}" - "${CONFIG_FILE}" "${tmp_existing_config}" "${DEFAULT_THRESHOLD_FREE_PERCENT}" "${DEFAULT_NOTIFY_NOT_BEFORE}" "${DEFAULT_NOTIFY_NOT_AFTER}" <<'PY'
+import json
+import math
+import re
+import sys
+from pathlib import Path
+
+config_path, defaults_path, default_threshold, default_not_before, default_not_after = sys.argv[1:]
+config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+
+
+def string_value(key):
+    value = config.get(key)
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def normalize_url(value):
+    value = value.rstrip("/")
+    if re.fullmatch(r"https?://.+", value):
+        return value
+    return ""
+
+
+def normalize_topic(value):
+    return value.strip("/")
+
+
+def normalize_threshold(value):
+    try:
+        threshold = float(value)
+    except (TypeError, ValueError):
+        return default_threshold
+    if not math.isfinite(threshold) or threshold < 0 or threshold > 100:
+        return default_threshold
+    return str(value)
+
+
+def normalize_time(value, fallback):
+    match = re.fullmatch(r"([01]?[0-9]|2[0-3]):([0-5][0-9])", str(value).strip())
+    if not match:
+        return fallback
+    return f"{int(match.group(1)):02d}:{int(match.group(2)):02d}"
+
+
+def blacklist_mount_points():
+    blacklist = config.get("blacklist", {})
+    if not isinstance(blacklist, dict):
+        return []
+    values = blacklist.get("mount_points", [])
+    if not isinstance(values, list):
+        return []
+
+    mount_points = []
+    for value in values:
+        mount_point = str(value).strip()
+        if mount_point and mount_point not in mount_points:
+            mount_points.append(mount_point)
+    return mount_points
+
+
+defaults = {
+    "ntfy_base_url": normalize_url(string_value("ntfy_base_url")),
+    "ntfy_topic": normalize_topic(string_value("ntfy_topic")),
+    "ntfy_bearer_token": string_value("ntfy_bearer_token"),
+    "machine_name": string_value("machine_name"),
+    "threshold_free_percent": normalize_threshold(
+        config.get("threshold_free_percent", default_threshold)
+    ),
+    "notify_not_before": normalize_time(
+        config.get("notify_not_before", default_not_before),
+        default_not_before,
+    ),
+    "notify_not_after": normalize_time(
+        config.get("notify_not_after", default_not_after),
+        default_not_after,
+    ),
+    "blacklist_mount_points": blacklist_mount_points(),
+}
+
+Path(defaults_path).write_text(
+    json.dumps(defaults, ensure_ascii=False, indent=2) + "\n",
+    encoding="utf-8",
+)
+PY
+}
+
+existing_default() {
+  local key="$1"
+  "${PYTHON_CMD[@]}" - "${tmp_existing_config}" "${key}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+defaults_path, key = sys.argv[1:]
+value = json.loads(Path(defaults_path).read_text(encoding="utf-8")).get(key, "")
+if isinstance(value, list):
+    print(" ".join(str(item) for item in value))
+elif value is not None:
+    print(str(value))
+PY
+}
+
+if [[ -f "${CONFIG_FILE}" ]]; then
+  if load_existing_config_defaults; then
+    existing_config_present=1
+    echo "Loaded defaults from ${CONFIG_FILE}."
+  else
+    echo "Could not load defaults from ${CONFIG_FILE}; using installer defaults." >&2
+    printf '{}\n' >"${tmp_existing_config}"
+  fi
+fi
+
 prompt_required() {
   local prompt="$1"
+  local default="${2:-}"
   local value=""
   while [[ -z "${value}" ]]; do
-    read -r -p "${prompt}: " value
+    if [[ -n "${default}" ]]; then
+      read -r -p "${prompt} [${default}]: " value
+      value="${value:-${default}}"
+    else
+      read -r -p "${prompt}: " value
+    fi
   done
   printf '%s' "${value}"
+}
+
+prompt_optional_secret() {
+  local prompt="$1"
+  local default="$2"
+  local value=""
+
+  if [[ -n "${default}" ]]; then
+    read -r -p "${prompt} [keep existing, '-' to clear]: " value
+    if [[ -z "${value}" ]]; then
+      printf '%s' "${default}"
+    elif [[ "${value}" == "-" ]]; then
+      printf ''
+    else
+      printf '%s' "${value}"
+    fi
+  else
+    read -r -p "${prompt} [empty]: " value
+    printf '%s' "${value}"
+  fi
 }
 
 prompt_time() {
@@ -102,7 +263,8 @@ PY
 }
 
 echo "ntfy base URL example: https://ntfy-base-server.ru"
-ntfy_base_url="$(prompt_required "ntfy base URL")"
+default_ntfy_base_url="$(existing_default "ntfy_base_url")"
+ntfy_base_url="$(prompt_required "ntfy base URL" "${default_ntfy_base_url}")"
 ntfy_base_url="${ntfy_base_url%/}"
 
 while [[ ! "${ntfy_base_url}" =~ ^https?:// ]]; do
@@ -111,30 +273,28 @@ while [[ ! "${ntfy_base_url}" =~ ^https?:// ]]; do
   ntfy_base_url="${ntfy_base_url%/}"
 done
 
-ntfy_topic="$(prompt_required "ntfy topic")"
+default_ntfy_topic="$(existing_default "ntfy_topic")"
+ntfy_topic="$(prompt_required "ntfy topic" "${default_ntfy_topic}")"
 ntfy_topic="${ntfy_topic#/}"
 ntfy_topic="${ntfy_topic%/}"
 
 echo 'Optional bearer token. Example: curl -H "Authorization: Bearer 78c5506d0740a58.........." -d "<Текст сообщения>" https://ntfy-base-server.ru/<topic>'
-read -r -p "ntfy bearer token [empty]: " ntfy_bearer_token
+default_ntfy_bearer_token="$(existing_default "ntfy_bearer_token")"
+ntfy_bearer_token="$(prompt_optional_secret "ntfy bearer token" "${default_ntfy_bearer_token}")"
 
-default_machine_name="$(hostname -f 2>/dev/null || hostname)"
+host_machine_name="$(hostname -f 2>/dev/null || hostname)"
+default_machine_name="$(existing_default "machine_name")"
+default_machine_name="${default_machine_name:-${host_machine_name}}"
 read -r -p "Machine name [${default_machine_name}]: " machine_name
 machine_name="${machine_name:-${default_machine_name}}"
 
-threshold_free_percent="$(prompt_threshold "Alert when free space is below percent" "${DEFAULT_THRESHOLD_FREE_PERCENT}")"
-notify_not_before="$(prompt_time "Do not notify before local time" "${DEFAULT_NOTIFY_NOT_BEFORE}")"
-notify_not_after="$(prompt_time "Do not notify after local time" "${DEFAULT_NOTIFY_NOT_AFTER}")"
+default_threshold_free_percent="$(existing_default "threshold_free_percent")"
+default_notify_not_before="$(existing_default "notify_not_before")"
+default_notify_not_after="$(existing_default "notify_not_after")"
 
-tmp_dir="$(mktemp -d)"
-trap 'rm -rf "${tmp_dir}"' EXIT
-
-tmp_config="${tmp_dir}/config.json"
-tmp_candidates="${tmp_dir}/candidates.json"
-tmp_blacklist="${tmp_dir}/blacklist.json"
-tmp_wrapper="${tmp_dir}/${APP_NAME}"
-tmp_service="${tmp_dir}/${APP_NAME}.service"
-tmp_timer="${tmp_dir}/${APP_NAME}.timer"
+threshold_free_percent="$(prompt_threshold "Alert when free space is below percent" "${default_threshold_free_percent:-${DEFAULT_THRESHOLD_FREE_PERCENT}}")"
+notify_not_before="$(prompt_time "Do not notify before local time" "${default_notify_not_before:-${DEFAULT_NOTIFY_NOT_BEFORE}}")"
+notify_not_after="$(prompt_time "Do not notify after local time" "${default_notify_not_after:-${DEFAULT_NOTIFY_NOT_AFTER}}")"
 
 "${PYTHON_CMD[@]}" - "${SOURCE_SCRIPT}" "${tmp_candidates}" "${machine_name}" <<'PY'
 import importlib.util
@@ -181,7 +341,23 @@ PY
 echo
 if [[ "${candidate_count}" -eq 0 ]]; then
   echo "No suitable local disks found for test messages."
-  printf '[]\n' >"${tmp_blacklist}"
+  if [[ "${existing_config_present}" -eq 1 ]]; then
+    "${PYTHON_CMD[@]}" - "${tmp_existing_config}" "${tmp_blacklist}" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+defaults_path, blacklist_path = sys.argv[1:]
+defaults = json.loads(Path(defaults_path).read_text(encoding="utf-8"))
+mount_points = defaults.get("blacklist_mount_points", [])
+Path(blacklist_path).write_text(
+    json.dumps(mount_points, ensure_ascii=False, indent=2) + "\n",
+    encoding="utf-8",
+)
+PY
+  else
+    printf '[]\n' >"${tmp_blacklist}"
+  fi
 else
   echo "Current test messages before blacklist:"
   "${PYTHON_CMD[@]}" - "${tmp_candidates}" <<'PY'
@@ -193,7 +369,29 @@ for candidate in json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")):
     print(f"{candidate['number']}. {candidate['message']}")
 PY
 
-  default_blacklist_numbers="$("${PYTHON_CMD[@]}" - "${tmp_candidates}" <<'PY'
+  if [[ "${existing_config_present}" -eq 1 ]]; then
+    default_blacklist_numbers="$("${PYTHON_CMD[@]}" - "${tmp_candidates}" "${tmp_existing_config}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+candidates_path, defaults_path = sys.argv[1:]
+candidates = json.loads(Path(candidates_path).read_text(encoding="utf-8"))
+defaults = json.loads(Path(defaults_path).read_text(encoding="utf-8"))
+mount_points = set(defaults.get("blacklist_mount_points", []))
+print(" ".join(str(candidate["number"]) for candidate in candidates if candidate["mount_point"] in mount_points))
+PY
+    )"
+    existing_blacklist_mount_points="$(existing_default "blacklist_mount_points")"
+    if [[ -n "${default_blacklist_numbers}" ]]; then
+      default_blacklist_label="${default_blacklist_numbers}"
+    elif [[ -n "${existing_blacklist_mount_points}" ]]; then
+      default_blacklist_label="keep existing"
+    else
+      default_blacklist_label="empty"
+    fi
+  else
+    default_blacklist_numbers="$("${PYTHON_CMD[@]}" - "${tmp_candidates}" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -201,24 +399,33 @@ from pathlib import Path
 candidates = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 print(" ".join(str(candidate["number"]) for candidate in candidates if candidate["default_blacklist"]))
 PY
-)"
-
-  if [[ -n "${default_blacklist_numbers}" ]]; then
-    read -r -p "Blacklist numbers [${default_blacklist_numbers}]: " blacklist_numbers
-    blacklist_numbers="${blacklist_numbers:-${default_blacklist_numbers}}"
-  else
-    read -r -p "Blacklist numbers [empty]: " blacklist_numbers
+    )"
+    default_blacklist_label="${default_blacklist_numbers:-empty}"
   fi
 
-  "${PYTHON_CMD[@]}" - "${tmp_candidates}" "${tmp_blacklist}" "${blacklist_numbers}" <<'PY'
+  blacklist_defaulted=0
+  read -r -p "Blacklist numbers [${default_blacklist_label}]: " blacklist_numbers
+  if [[ -z "${blacklist_numbers}" ]]; then
+    blacklist_numbers="${default_blacklist_numbers}"
+    blacklist_defaulted=1
+  fi
+
+  "${PYTHON_CMD[@]}" - "${tmp_candidates}" "${tmp_blacklist}" "${blacklist_numbers}" "${tmp_existing_config}" "${blacklist_defaulted}" <<'PY'
 import json
 from pathlib import Path
 import sys
 
-candidates_path, blacklist_path, raw_numbers = sys.argv[1:]
+candidates_path, blacklist_path, raw_numbers, defaults_path, defaulted = sys.argv[1:]
 candidates = json.loads(Path(candidates_path).read_text(encoding="utf-8"))
 candidates_by_number = {candidate["number"]: candidate for candidate in candidates}
 mount_points = []
+
+if defaulted == "1":
+    defaults = json.loads(Path(defaults_path).read_text(encoding="utf-8"))
+    for value in defaults.get("blacklist_mount_points", []):
+        mount_point = str(value).strip()
+        if mount_point and mount_point not in mount_points:
+            mount_points.append(mount_point)
 
 for raw_number in raw_numbers.split():
     if not raw_number.isdigit():
