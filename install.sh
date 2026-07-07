@@ -83,8 +83,9 @@ def string_value(key):
     return str(value).strip()
 
 
-def normalize_url(value):
-    value = value.rstrip("/")
+def normalize_url(value, *, strip_trailing_slash=True):
+    if strip_trailing_slash:
+        value = value.rstrip("/")
     if re.fullmatch(r"https?://.+", value):
         return value
     return ""
@@ -131,6 +132,10 @@ defaults = {
     "ntfy_base_url": normalize_url(string_value("ntfy_base_url")),
     "ntfy_topic": normalize_topic(string_value("ntfy_topic")),
     "ntfy_bearer_token": string_value("ntfy_bearer_token"),
+    "mattermost_webhook_url": normalize_url(
+        string_value("mattermost_webhook_url"),
+        strip_trailing_slash=False,
+    ),
     "machine_name": string_value("machine_name"),
     "threshold_free_percent": normalize_threshold(
         config.get("threshold_free_percent", default_threshold)
@@ -214,6 +219,33 @@ prompt_optional_secret() {
   fi
 }
 
+prompt_url_or_disabled() {
+  local prompt="$1"
+  local default="${2:-}"
+  local default_label=""
+  local value=""
+
+  while true; do
+    if [[ -n "${default}" ]]; then
+      default_label="${default}"
+      read -r -p "${prompt} [${default_label}; '-' to disable]: " value
+      value="${value:-${default}}"
+    else
+      read -r -p "${prompt} ('-' to disable): " value
+    fi
+
+    if [[ "${value}" == "-" ]]; then
+      printf ''
+      return
+    fi
+    if [[ "${value}" =~ ^https?://.+ ]]; then
+      printf '%s' "${value}"
+      return
+    fi
+    echo "Please enter a full URL starting with http:// or https://, or '-' to disable." >&2
+  done
+}
+
 prompt_time() {
   local prompt="$1"
   local default="$2"
@@ -262,25 +294,36 @@ PY
   done
 }
 
+echo "Notification channels are optional. Enter '-' instead of the URL to disable ntfy or Mattermost."
 echo "ntfy base URL example: https://ntfy-base-server.ru"
 default_ntfy_base_url="$(existing_default "ntfy_base_url")"
-ntfy_base_url="$(prompt_required "ntfy base URL" "${default_ntfy_base_url}")"
+ntfy_base_url="$(prompt_url_or_disabled "ntfy base URL" "${default_ntfy_base_url}")"
 ntfy_base_url="${ntfy_base_url%/}"
 
-while [[ ! "${ntfy_base_url}" =~ ^https?:// ]]; do
-  echo "Please enter a full URL starting with http:// or https://"
-  ntfy_base_url="$(prompt_required "ntfy base URL")"
-  ntfy_base_url="${ntfy_base_url%/}"
-done
+ntfy_topic=""
+ntfy_bearer_token=""
+if [[ -n "${ntfy_base_url}" ]]; then
+  default_ntfy_topic="$(existing_default "ntfy_topic")"
+  ntfy_topic="$(prompt_required "ntfy topic" "${default_ntfy_topic}")"
+  ntfy_topic="${ntfy_topic#/}"
+  ntfy_topic="${ntfy_topic%/}"
 
-default_ntfy_topic="$(existing_default "ntfy_topic")"
-ntfy_topic="$(prompt_required "ntfy topic" "${default_ntfy_topic}")"
-ntfy_topic="${ntfy_topic#/}"
-ntfy_topic="${ntfy_topic%/}"
+  echo 'Optional bearer token. Example: curl -H "Authorization: Bearer 78c5506d0740a58.........." -d "<Текст сообщения>" https://ntfy-base-server.ru/<topic>'
+  default_ntfy_bearer_token="$(existing_default "ntfy_bearer_token")"
+  ntfy_bearer_token="$(prompt_optional_secret "ntfy bearer token" "${default_ntfy_bearer_token}")"
+else
+  echo "ntfy disabled."
+fi
 
-echo 'Optional bearer token. Example: curl -H "Authorization: Bearer 78c5506d0740a58.........." -d "<Текст сообщения>" https://ntfy-base-server.ru/<topic>'
-default_ntfy_bearer_token="$(existing_default "ntfy_bearer_token")"
-ntfy_bearer_token="$(prompt_optional_secret "ntfy bearer token" "${default_ntfy_bearer_token}")"
+default_mattermost_webhook_url="$(existing_default "mattermost_webhook_url")"
+mattermost_webhook_url="$(prompt_url_or_disabled "Mattermost incoming webhook URL (optional)" "${default_mattermost_webhook_url:-"-"}")"
+if [[ -z "${mattermost_webhook_url}" ]]; then
+  echo "Mattermost disabled."
+fi
+
+if [[ -z "${ntfy_base_url}" && -z "${mattermost_webhook_url}" ]]; then
+  echo "No notification channels enabled; generated alerts will be logged but not sent."
+fi
 
 host_machine_name=""
 if command -v hostname >/dev/null 2>&1; then
@@ -456,7 +499,7 @@ else:
 PY
 fi
 
-"${PYTHON_CMD[@]}" - "${tmp_config}" "${ntfy_base_url}" "${ntfy_topic}" "${ntfy_bearer_token}" "${machine_name}" "${threshold_free_percent}" "${notify_not_before}" "${notify_not_after}" "${tmp_blacklist}" <<'PY'
+"${PYTHON_CMD[@]}" - "${tmp_config}" "${ntfy_base_url}" "${ntfy_topic}" "${ntfy_bearer_token}" "${mattermost_webhook_url}" "${machine_name}" "${threshold_free_percent}" "${notify_not_before}" "${notify_not_after}" "${tmp_blacklist}" <<'PY'
 import json
 from pathlib import Path
 import sys
@@ -466,6 +509,7 @@ import sys
     ntfy_base_url,
     ntfy_topic,
     ntfy_bearer_token,
+    mattermost_webhook_url,
     machine_name,
     threshold_free_percent,
     notify_not_before,
@@ -474,9 +518,10 @@ import sys
 ) = sys.argv[1:]
 token = ntfy_bearer_token.strip()
 config = {
-    "ntfy_base_url": ntfy_base_url.strip(),
-    "ntfy_topic": ntfy_topic.strip(),
+    "ntfy_base_url": ntfy_base_url.strip() or None,
+    "ntfy_topic": ntfy_topic.strip() or None,
     "ntfy_bearer_token": token or None,
+    "mattermost_webhook_url": mattermost_webhook_url.strip() or None,
     "machine_name": machine_name.strip(),
     "threshold_free_percent": float(threshold_free_percent),
     "notify_not_before": notify_not_before.strip(),
@@ -500,7 +545,7 @@ WRAPPER
 
 cat >"${tmp_service}" <<SERVICE
 [Unit]
-Description=Check local disk free space and notify via ntfy
+Description=Check local disk free space and send configured notifications
 Wants=network-online.target
 After=network-online.target
 
@@ -511,7 +556,7 @@ SERVICE
 
 cat >"${tmp_timer}" <<TIMER
 [Unit]
-Description=Run free-space ntfy alarm every hour
+Description=Run free-space alarm every hour
 
 [Timer]
 OnBootSec=5min

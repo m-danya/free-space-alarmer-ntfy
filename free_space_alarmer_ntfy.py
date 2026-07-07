@@ -266,12 +266,19 @@ def load_config(path: str) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         raise SystemExit(f"Invalid JSON in {path}: {exc}") from None
 
-    required_fields = ("ntfy_base_url", "ntfy_topic")
-    missing_fields = [field for field in required_fields if not str(config.get(field, "")).strip()]
-    if missing_fields:
-        raise SystemExit(f"Missing required config fields: {', '.join(missing_fields)}")
-
     config.setdefault("machine_name", socket.gethostname())
+    ntfy_base_url = normalize_http_url(config.get("ntfy_base_url"), "ntfy_base_url", strip_trailing_slash=True)
+    ntfy_topic = normalize_ntfy_topic(config.get("ntfy_topic"))
+    if ntfy_base_url and not ntfy_topic:
+        raise SystemExit("Invalid config: ntfy_topic is required when ntfy_base_url is set")
+
+    config["ntfy_base_url"] = ntfy_base_url or None
+    config["ntfy_topic"] = ntfy_topic or None
+    config["ntfy_bearer_token"] = string_config_value(config.get("ntfy_bearer_token")) or None
+    config["mattermost_webhook_url"] = normalize_http_url(
+        config.get("mattermost_webhook_url"),
+        "mattermost_webhook_url",
+    ) or None
     config["threshold_free_percent"] = parse_threshold_free_percent(
         config.get("threshold_free_percent", DEFAULT_THRESHOLD_FREE_PERCENT)
     )
@@ -285,6 +292,30 @@ def load_config(path: str) -> dict[str, Any]:
     )
     config.setdefault("blacklist", {"mount_points": []})
     return config
+
+
+def string_config_value(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def normalize_http_url(value: Any, field_name: str, *, strip_trailing_slash: bool = False) -> str:
+    text = string_config_value(value)
+    if not text or text == "-":
+        return ""
+
+    parsed = urllib.parse.urlparse(text)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise SystemExit(f"Invalid config: {field_name} must be a full http:// or https:// URL")
+
+    if strip_trailing_slash:
+        return text.rstrip("/")
+    return text
+
+
+def normalize_ntfy_topic(value: Any) -> str:
+    return string_config_value(value).strip("/")
 
 
 def parse_threshold_free_percent(value: Any) -> float:
@@ -376,6 +407,50 @@ def send_ntfy_message(message: str, config: dict[str, Any]) -> None:
         raise RuntimeError(f"Cannot reach ntfy server: {exc.reason}") from exc
 
 
+def send_mattermost_message(message: str, config: dict[str, Any]) -> None:
+    request = urllib.request.Request(
+        str(config["mattermost_webhook_url"]),
+        data=json.dumps({"text": message}, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            response.read()
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Mattermost returned HTTP {exc.code}: {body}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Cannot reach Mattermost webhook: {exc.reason}") from exc
+
+
+def has_notification_channel(config: dict[str, Any]) -> bool:
+    return bool(
+        (config.get("ntfy_base_url") and config.get("ntfy_topic"))
+        or config.get("mattermost_webhook_url")
+    )
+
+
+def send_notification_message(message: str, config: dict[str, Any]) -> None:
+    errors = []
+
+    if config.get("ntfy_base_url") and config.get("ntfy_topic"):
+        try:
+            send_ntfy_message(message, config)
+        except RuntimeError as exc:
+            errors.append(str(exc))
+
+    if config.get("mattermost_webhook_url"):
+        try:
+            send_mattermost_message(message, config)
+        except RuntimeError as exc:
+            errors.append(str(exc))
+
+    if errors:
+        raise RuntimeError("Notification send failed: " + "; ".join(errors))
+
+
 def collect_usages(config: dict[str, Any] | None = None) -> list[DiskUsage]:
     usages: list[DiskUsage] = []
     for mount in selected_mounts():
@@ -435,11 +510,17 @@ def run(config: dict[str, Any], *, test_mode: bool, dry_run: bool) -> int:
             if usage.free_percent < threshold
         ]
 
+    if messages and not dry_run and not has_notification_channel(config):
+        print("No notification channels configured; no messages sent.", file=sys.stderr)
+        for message in messages:
+            print(message)
+        return 0
+
     for message in messages:
         if dry_run:
             print(message)
             continue
-        send_ntfy_message(message, config)
+        send_notification_message(message, config)
         print(message)
 
     if not messages and dry_run:
@@ -450,11 +531,11 @@ def run(config: dict[str, Any], *, test_mode: bool, dry_run: bool) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Check real local disks and send ntfy alerts when free space is below threshold."
+        description="Check real local disks and send alerts when free space is below threshold."
     )
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help=f"Config path, default: {DEFAULT_CONFIG_PATH}")
     parser.add_argument("--test", action="store_true", help="Send a message for every selected disk, ignoring threshold.")
-    parser.add_argument("--dry-run", action="store_true", help="Print messages instead of sending them to ntfy.")
+    parser.add_argument("--dry-run", action="store_true", help="Print messages instead of sending notifications.")
     parser.add_argument("--list-disks", action="store_true", help="Print selected local disks and exit.")
     return parser.parse_args()
 
